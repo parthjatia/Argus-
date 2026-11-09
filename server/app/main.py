@@ -8,6 +8,7 @@ from typing import Literal
 
 import psycopg
 import redis.asyncio as aioredis
+import redis.exceptions
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -24,12 +25,18 @@ CHECK_TIMEOUT_S = 2.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    pool = create_pool(get_settings())
+    settings = get_settings()
+    pool = create_pool(settings)
     await pool.open(wait=False)  # don't block startup if Postgres is down
     app.state.pool = pool
+    # Connects lazily on first use, so the server also starts while Redis is down.
+    app.state.redis = aioredis.from_url(
+        settings.redis_url, socket_connect_timeout=2, socket_timeout=2
+    )
     try:
         yield
     finally:
+        await app.state.redis.aclose()
         await pool.close()
 
 
@@ -43,6 +50,12 @@ async def database_unavailable(request: Request, exc: psycopg.OperationalError) 
     # tells the SDK this is temporary and worth retrying with backoff.
     logger.error("database unavailable on %s: %r", request.url.path, exc)
     return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+
+
+@app.exception_handler(redis.exceptions.RedisError)
+async def queue_unavailable(request: Request, exc: redis.exceptions.RedisError) -> JSONResponse:
+    logger.error("redis unavailable on %s: %r", request.url.path, exc)
+    return JSONResponse(status_code=503, content={"detail": "queue unavailable"})
 
 
 CheckStatus = Literal["ok", "error"]

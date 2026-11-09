@@ -1,0 +1,9 @@
+# Build context for demo/Dockerfile is the repo root: keep it small and secret-free.
+.env
+.git
+.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/node_modules
+**/.next

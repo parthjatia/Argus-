@@ -22,8 +22,9 @@ I'm building this to learn and to explain it in interviews. Follow these rules:
 2. **Dependencies:** well-known packages that fit the Stack below may be added without asking;
    list them in the summary. Prefer the standard library where reasonable.
 3. **Only stop and ask** if truly blocked or a decision is hard to undo.
-4. **After each milestone:** run all tests and ruff, fix failures, commit, and give a summary of
-   at most 5 lines.
+4. **After each milestone:** run all tests and ruff, fix failures, and give a summary of at most
+   5 lines. **Never run `git commit`**: leave changes for me to review and commit, and never add
+   Claude as co-author or contributor (no `Co-Authored-By` / "Generated with" lines).
 5. **Keep `docs/LEARNING.md`:** for every core component (SDK context/nesting, SDK exporter,
    API key auth, ingestion + idempotency, Redis Stream worker), add a short beginner-friendly
    explanation of how it works and what would break without it.
@@ -57,14 +58,18 @@ argus/
 ├── docker-compose.yml        # postgres, redis, server, worker, dashboard
 ├── .env.example
 ├── Makefile
-├── sdk/                      # pip-installable package: argus
+├── sdk/                      # pip install -e sdk  (dist name argus-sdk, import argus)
 │   ├── argus/
-│   │   ├── __init__.py       # init(), observe, span, wrap_openai
-│   │   ├── context.py        # contextvars: current trace/span
+│   │   ├── __init__.py       # init(), observe, span, wrap_openai, flush, get_stats
+│   │   ├── client.py         # global state: init(), active exporter, atexit flush
+│   │   ├── context.py        # contextvars: current span
+│   │   ├── spans.py          # Span object + span() context manager (sync + async)
 │   │   ├── decorators.py     # @observe for sync + async functions
 │   │   ├── exporter.py       # bounded queue + background batch sender
-│   │   ├── models.py         # SpanEvent (Pydantic)
+│   │   ├── serialize.py      # JSON-safe conversion + truncation
+│   │   ├── models.py         # SpanEvent (dataclass, wire format)
 │   │   └── integrations/openai.py   # wraps OpenAI-compatible clients
+│   ├── examples/e2e_trace.py # sends a nested trace to a running server
 │   └── tests/
 ├── server/
 │   ├── app/
@@ -76,18 +81,22 @@ argus/
 │   │   ├── pricing.py        # cost from tokens using model_prices
 │   │   ├── schemas.py
 │   │   └── db.py
+│   ├── app/streams.py        # stream / group names shared by API and worker
+│   ├── app/storage.py        # idempotent batch INSERT + cost from model_prices
 │   ├── worker/consumer.py    # Redis Stream → Postgres batch writer
-│   ├── migrations/           # plain SQL files, applied in order
+│   ├── migrations/           # plain SQL files, applied in order (0002 = example prices)
 │   └── tests/
 ├── dashboard/                # Next.js app
-├── demo/
+├── demo/                     # Docker image built from the repo root (needs ../sdk)
 │   ├── arena/
-│   │   ├── debate.py         # runs a debate: rounds, turns, judge
-│   │   ├── agents.py         # debater + judge prompts
+│   │   ├── debate.py         # one debate = one trace (python -m arena.debate)
+│   │   ├── agents.py         # debater + judge prompts, JudgeVerdict validation + retry
 │   │   ├── tools.py          # fake lookup_fact() with failure injection
-│   │   └── llm.py            # provider switch: fake | ollama | openai
+│   │   ├── faults.py         # ARENA_* failure injection settings
+│   │   └── llm.py            # provider switch: fake | ollama | openai (+ fault layer)
 │   ├── topics.yaml
-│   └── traffic.py            # runs many debates to generate traces
+│   ├── traffic.py            # runs many debates to generate traces
+│   └── tests/
 └── loadtest/
 ```
 
@@ -261,7 +270,7 @@ cp .env.example .env
 docker compose up -d --build      # postgres, redis, server, worker, dashboard
 make migrate                      # apply SQL migrations
 make seed                         # create a demo project + print its API key
-make demo                         # run one debate with LLM_PROVIDER=fake
+make demo TOPIC="..."             # one debate (LLM_PROVIDER from .env, default fake)
 make traffic N=50                 # run many debates
 make test                         # pytest for sdk + server
 make lint                         # ruff
@@ -272,15 +281,15 @@ make load                         # load test the ingestion API
 
 ## Testing checklist
 
-- [ ] SDK: nested sync spans get the correct parent
-- [ ] SDK: nested async spans and concurrent tasks don't mix up parents
-- [ ] SDK: exceptions mark the span as error and are re-raised
-- [ ] SDK: exporter never blocks the caller when the server is down
-- [ ] SDK: queue overflow drops oldest events and counts them
+- [x] SDK: nested sync spans get the correct parent
+- [x] SDK: nested async spans and concurrent tasks don't mix up parents
+- [x] SDK: exceptions mark the span as error and are re-raised
+- [x] SDK: exporter never blocks the caller when the server is down
+- [x] SDK: queue overflow drops oldest events and counts them
 - [x] Server: invalid API key → 401; invalid batch → 422
 - [x] Server: the same batch sent twice → each span stored once
 - [x] Server: a child span arriving before its parent is stored (shown correctly: dashboard, Milestone 4)
-- [ ] Worker: killed mid-batch → messages are reclaimed and stored, no duplicates
+- [x] Worker: killed mid-batch → messages are reclaimed and stored, no duplicates
 - [ ] End-to-end: `make demo` produces a complete trace visible in the dashboard
 - [ ] Load test: record events/second and p95 ingest latency in the README
 
@@ -327,6 +336,29 @@ make load                         # load test the ingestion API
 | Unknown span fields are ignored (`extra="ignore"`) | A newer SDK can send new fields to an older server without losing data | Typos in field names aren't caught |
 | Limits: 1,000 spans/batch, 5 MB body, 200-char names, `model` required for `generation` | Bound memory and row size per request | Real payloads above 5 MB are rejected (the SDK truncates at 32 KB per field) |
 | Postgres errors → `503`; the pool opens without waiting | 5xx tells the SDK to retry; the server starts and `/health` reports the problem while Postgres is down | Requests wait up to `DB_POOL_TIMEOUT_S` (3 s) before the 503 |
+| SDK uses stdlib `dataclasses`, not Pydantic | Host apps may pin Pydantic v1 or another v2; the SDK must not cause version conflicts. Only dependency: `httpx` | No automatic validation in the SDK, so it mirrors the server's limits by hand (name ≤ 200, `model` set for generations, …) |
+| SDK sanitises every span to pass server validation | The server rejects the **whole batch** on one bad span, and the SDK doesn't retry 4xx; one bad span would lose 99 good ones | Server rules are duplicated in `spans.py` |
+| `end_time` = `start_time` + monotonic `perf_counter()` duration | A wall-clock jump (NTP) can't produce `end_time < start_time`, which the server would reject | `end_time` can drift slightly from wall-clock time for very long spans |
+| Queue = `deque` + one `threading.Condition`; drop-oldest on overflow | `enqueue()` is O(1), never blocks or does I/O; the newest data is usually the most useful | Oldest events are lost under sustained overload (counted in `get_stats()["dropped"]`) |
+| Batches capped at 100 events **and** ~4 MB | Server rejects bodies over 5 MB (413); two 32 KB fields × 100 spans would exceed it | More requests when payloads are large |
+| Retries: up to 5, exponential backoff with full jitter (`uniform(0, min(10s, 0.5s·2ⁿ))`), only for network errors and 5xx | Jitter stops many clients retrying in lockstep after an outage; 4xx won't succeed on retry | A long outage (> ~30 s of retries) loses those batches (counted as `failed`) |
+| `atexit` flush with a 5 s limit; daemon thread | Spans aren't lost on normal exit, but a dead server can't hang shutdown | Spans still queued after 5 s, or on a hard kill, are lost |
+| `wrap_openai` is duck-typed and detects async by the **result** (`isawaitable`) | No `openai` dependency; OpenAI's decorators hide whether `create` is async | Streaming responses are passed through without output/tokens |
+| No `contextvars` propagation into new threads | Python doesn't copy context into `threading.Thread` / executors | Spans in worker threads start new traces unless the caller uses `contextvars.copy_context().run(...)` |
+| One stream message per span; the `XADD`s of a request in one `MULTI` | Worker batches by message count and trimming is per span; `MULTI` keeps a request all-or-nothing in Redis | More messages than one per batch |
+| `MAXLEN ~ 1,000,000` on `XADD` (`STREAM_MAXLEN`) | Bounds Redis memory if the worker is down | A very long worker outage can trim spans that were never stored |
+| Worker is synchronous (redis-py + psycopg), a separate `worker` service, same image as the server | Simplest correct loop; scale out by running more workers in the group | One batch at a time per worker process |
+| `XACK` only after `COMMIT`; `XAUTOCLAIM` after 60 s idle (`CLAIM_MIN_IDLE_MS`) on startup and every 30 s | At-least-once delivery + idempotent inserts = each span stored exactly once | A dead worker's messages wait at least 60 s before being reclaimed |
+| Stable `WORKER_NAME`; on startup and after errors the worker re-reads its own pending messages (`XREADGROUP ... 0`) | A restarted worker finishes its own messages at once instead of waiting for `XAUTOCLAIM` | Two workers must never share a name |
+| Poison messages: batch retried row by row, bad ones to the `spans:dead` stream + `XACK` | One bad message can't block ingestion forever | Dead letters need manual inspection |
+| `cost_usd` computed inside the `INSERT` (scalar subquery on `model_prices`, latest `valid_from <= start_time`) | One statement, always the current price table, no cache to go stale; history keeps the price that applied then | Price changes don't re-price stored spans (by design) |
+| No price or no tokens: `cost_usd` NULL; free models priced explicitly at 0 | "Unknown" and "free" are different facts | Unpriced models show no cost until a price row is added |
+| Arena: every provider (including `fake`) is an OpenAI-shaped client wrapped by `wrap_openai` | One code path; the fake provider produces the same span shapes as Ollama/OpenAI | The fake mimics only the response fields we use |
+| Faults are injected in a client layer *inside* `wrap_openai` | Injected timeouts and slowness appear in the generation span, like real ones |  |
+| Judge: JSON mode + Pydantic `JudgeVerdict`; one retry that includes the validation error; each attempt is a `judge.attempt` span | Both attempts visible in the trace; the retry tells the model what was wrong | Two invalid answers fail the debate (`JudgeFailed`) |
+| LLM timeouts retried once per call; a turn that still fails is recorded and the debate continues; a failed judge fails the debate | A realistic mix of partial failures and failed traces |  |
+| `traffic.py` uses threads | Each thread starts with an empty context, so each debate is its own trace |  |
+| Demo dependencies: PyYAML (topics), `openai` (only for ollama/openai, imported lazily) | Well-known; the fake provider needs no network or API key |  |
 | `/health` returns `503` when Postgres or Redis is unreachable | Load balancers and `docker compose` healthchecks react to the status code, not the body | The body says which dependency failed, but details stay in server logs |
 | Dev server image includes pytest + ruff; repo mounted at `/repo` | `make test` / `make lint` only need Docker on the host, same environment for everyone | Image is larger than a production image; a slim prod image is a later step |
 | Send spans when they end, not start + end events | Simpler protocol, one row per span | Long-running spans are invisible until they finish |

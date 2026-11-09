@@ -3,7 +3,7 @@ target-version = "py312"
 line-length = 100
 # Where first-party packages live (server's `app`, later the sdk's `argus`),
 # so import sorting groups them separately from third-party packages.
-src = ["server", "sdk"]
+src = ["server", "sdk", "demo"]
 
 [lint]
 # E/F: pycodestyle + pyflakes, I: import sorting, UP: modern syntax,

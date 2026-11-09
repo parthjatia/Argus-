@@ -2,7 +2,9 @@
 
 Checks run cheapest-first and stop at the first failure:
   1. body size  → 413      2. API key → 401      3. validation → 422
-  4. DB insert  → 202 (or 503 if Postgres is unreachable, see main.py)
+  4. XADD to the Redis stream → 202 (or 503 if Postgres/Redis is down, see main.py)
+
+A worker (worker/consumer.py) writes the spans to Postgres afterwards.
 """
 
 import logging
@@ -11,13 +13,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
+from redis.asyncio import Redis
 
 from app.auth import require_project
-from app.db import get_pool
+from app.config import get_settings
 from app.schemas import IngestBatch, IngestResponse
-from app.storage import store_spans
+from app.streams import STREAM, get_redis
 
 logger = logging.getLogger("argus.ingest")
 
@@ -58,7 +60,7 @@ async def read_body_limited(request: Request) -> bytes:
 async def ingest(
     request: Request,
     project_id: Annotated[UUID, Depends(require_project)],
-    pool: Annotated[AsyncConnectionPool, Depends(get_pool)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> IngestResponse:
     # We parse the body ourselves instead of declaring `batch: IngestBatch`, because
     # FastAPI would parse it BEFORE running the auth dependency. This way
@@ -74,8 +76,20 @@ async def ingest(
         ]
         raise RequestValidationError(errors) from exc
 
-    async with pool.connection() as conn:
-        inserted = await store_spans(conn, project_id, batch.batch)
+    # One stream message per span. MULTI/EXEC (transaction=True) makes the batch
+    # all-or-nothing in Redis too; if it fails the client gets 503 and retries, and the
+    # worker's ON CONFLICT DO NOTHING absorbs anything that was written twice.
+    # MAXLEN ~ caps memory: Redis trims the oldest entries (approximately, cheaply).
+    maxlen = get_settings().stream_maxlen
+    async with redis.pipeline(transaction=True) as pipe:
+        for span in batch.batch:
+            pipe.xadd(
+                STREAM,
+                {"project_id": str(project_id), "span": span.model_dump_json()},
+                maxlen=maxlen,
+                approximate=True,
+            )
+        await pipe.execute()
 
-    logger.info("ingest project=%s accepted=%d inserted=%d", project_id, len(batch.batch), inserted)
+    logger.debug("ingest project=%s queued=%d", project_id, len(batch.batch))
     return IngestResponse(accepted=len(batch.batch))

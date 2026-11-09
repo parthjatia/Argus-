@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: argus-sdk
+Version: 0.1.0
+Summary: Tracing SDK for LLM applications (Argus)
+Requires-Python: >=3.12
+Requires-Dist: httpx<1,>=0.27
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8.3; extra == "dev"

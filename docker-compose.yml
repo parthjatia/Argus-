@@ -1,5 +1,5 @@
 # Local development stack. Copy .env.example to .env first.
-# Later milestones add: worker, dashboard.
+# Later milestones add: dashboard.
 
 services:
   postgres:
@@ -37,6 +37,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
+      STREAM_MAXLEN: ${STREAM_MAXLEN:-1000000}
     ports:
       - "8000:8000"
     # Mount the whole repo so code edits are visible without a rebuild and
@@ -49,6 +50,53 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # Redis Stream "spans" → Postgres. Same image as the server.
+  worker:
+    build: ./server
+    command: ["python", "-m", "worker.consumer"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      WORKER_NAME: worker-1  # stable name: a restarted worker resumes its own pending messages
+      CLAIM_MIN_IDLE_MS: ${CLAIM_MIN_IDLE_MS:-60000}
+    volumes:
+      - ./:/repo
+    working_dir: /repo/server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Debate Arena. Not started by `up` (profile); used via `make demo` / `make traffic`.
+  demo:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: demo/Dockerfile
+    environment:
+      ARGUS_HOST: http://server:8000
+      ARGUS_API_KEY: ${ARGUS_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      ARENA_TIMEOUT_RATE: ${ARENA_TIMEOUT_RATE:-0}
+      ARENA_BAD_JSON_RATE: ${ARENA_BAD_JSON_RATE:-0}
+      ARENA_SLOW_RATE: ${ARENA_SLOW_RATE:-0}
+      ARENA_SLOW_SECONDS: ${ARENA_SLOW_SECONDS:-2}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      PRO_MODEL: ${PRO_MODEL:-}
+      CON_MODEL: ${CON_MODEL:-}
+      JUDGE_MODEL: ${JUDGE_MODEL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # reach Ollama on the host (Linux too)
+    volumes:
+      - ./:/repo
+    working_dir: /repo/demo
+    depends_on:
+      - server
 
 volumes:
   pgdata:

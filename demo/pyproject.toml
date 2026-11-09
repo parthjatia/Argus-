@@ -1,0 +1,5 @@
+# Tool config only. Dependencies: requirements.txt + the SDK (pip install -e ../sdk).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "../sdk"]

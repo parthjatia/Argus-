@@ -1,6 +1,7 @@
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, LiteralString
 from uuid import UUID, uuid4
 
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.seed import create_project_key
+from worker.consumer import Worker
 
 
 @dataclass
@@ -18,6 +20,7 @@ class Api:
     db: str
     key: str
     project_id: UUID
+    worker: Worker
 
     def post(self, body: Any, key: str | None = "default") -> Any:
         headers = {} if key is None else {"X-API-Key": self.key if key == "default" else key}
@@ -26,16 +29,18 @@ class Api:
         return self.client.post("/v1/ingest", json=body, headers=headers)
 
     def rows(self, sql: LiteralString = "SELECT * FROM spans", params: tuple = ()) -> list[tuple]:
+        self.worker.drain()  # ingest only queues in Redis; let the worker store everything first
         with psycopg.connect(self.db) as conn:
             return conn.execute(sql, params).fetchall()
 
 
 @pytest.fixture
-def api(migrated_db: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[Api]:
+def api(migrated_db: str, make_worker, monkeypatch: pytest.MonkeyPatch) -> Iterator[Api]:
     monkeypatch.setenv("DATABASE_URL", migrated_db)  # lifespan builds the pool from this
     project_id, key = create_project_key(migrated_db, "test")
-    with TestClient(app) as client:  # `with` runs the lifespan (opens the pool)
-        yield Api(client, migrated_db, key, project_id)
+    worker = make_worker()  # also sets REDIS_URL to the test Redis DB
+    with TestClient(app) as client:  # `with` runs the lifespan (opens pool + Redis)
+        yield Api(client, migrated_db, key, project_id, worker)
 
 
 def make_span(**overrides: Any) -> dict[str, Any]:
@@ -96,7 +101,7 @@ def test_valid_batch_is_stored_under_the_keys_project(api: Api) -> None:
     rows = api.rows("SELECT project_id, id, kind, model, input, input_tokens, cost_usd FROM spans")
     assert rows == [
         (api.project_id, UUID(gen["span_id"]), "generation", "llama3.1",
-         {"topic": "cats vs dogs"}, 412, None),
+         {"topic": "cats vs dogs"}, 412, Decimal("0")),  # llama3.1 is priced at $0
     ]  # fmt: skip
 
 
@@ -200,3 +205,28 @@ def test_database_down_is_503(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     assert resp.status_code == 503
     assert resp.json() == {"detail": "database unavailable"}
+
+
+def test_redis_down_is_503(api: Api, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:1/0")
+    with TestClient(app) as client:  # new lifespan → Redis client pointing nowhere
+        resp = client.post(
+            "/v1/ingest", json={"batch": [make_span()]}, headers={"X-API-Key": api.key}
+        )
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "queue unavailable"}
+
+
+def test_ingest_queues_one_message_per_span(api: Api) -> None:
+    assert api.post({"batch": [make_span(), make_span()]}).status_code == 202
+    assert api.worker.r.xlen("spans") == 2  # queued, not yet in Postgres
+    with psycopg.connect(api.db) as conn:
+        assert conn.execute("SELECT count(*) FROM spans").fetchone() == (0,)
+
+
+def test_stream_length_is_capped(api: Api, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STREAM_MAXLEN", "10")
+    for _ in range(10):
+        api.post({"batch": [make_span() for _ in range(100)]})
+    # MAXLEN ~ trims in whole internal nodes (~100 entries), so "about 10", not exactly.
+    assert api.worker.r.xlen("spans") < 300

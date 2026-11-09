@@ -39,7 +39,7 @@ like bcrypt are for human passwords. A deterministic hash also lets us look keys
 | 1. Body size ≤ 5 MB (`Content-Length`, and counted while reading) | `413` | Don't even read a huge body |
 | 2. API key | `401` | Strangers learn nothing about our format |
 | 3. Pydantic validation (`IngestBatch` → `SpanIn`) | `422` | Bad data never reaches the database |
-| 4. Insert | `202`, or `503` if Postgres is down | |
+| 4. `XADD` each span to the Redis stream `spans` (one `MULTI` transaction) | `202`, or `503` if Postgres/Redis is down | The worker writes to Postgres later (section 7) |
 
 - Pydantic models describe valid data: UUIDs, allowed `kind`/`status` values, timestamps **with**
   a timezone, `end_time >= start_time`, `model` required for `generation`, 1–1,000 spans.
@@ -55,13 +55,16 @@ like bcrypt are for human passwords. A deterministic hash also lets us look keys
 - Without the size limit: one client could send a 2 GB body and exhaust server memory.
 - Without validation: bad rows crash the insert (500), or worse, get stored and break the dashboard.
 - Without `AwareDatetime`: a timestamp with no timezone could be read as the wrong hour.
-- Without the `503` handler: a database outage would surface as a generic `500`.
+- Without the `503` handlers: a database or Redis outage would surface as a generic `500`.
 
 ---
 
-## 3. Idempotent inserts (`server/app/storage.py`)
+## 3. Idempotent inserts (`server/app/storage.py`, run by the worker)
 
-**The problem.** The SDK sends a batch; the server stores it; the `202` reply gets lost. The SDK
+**The problem.** Duplicates come from two places: (1) the SDK sends a batch, the server queues
+it, the `202` reply gets lost, and the SDK resends; (2) a worker crashes after writing to
+Postgres but before telling Redis "done", so Redis delivers the message again (section 7).
+In case (1), the SDK
 sees a timeout and **retries** the same batch. That retry is correct behaviour, so the server must
 handle receiving the same span twice.
 
@@ -89,3 +92,157 @@ handle receiving the same span twice.
 - With `PRIMARY KEY (id)` only: project B could send a span with project A's ID first, and A's real
   span would be silently skipped.
 - Without the transaction: a failure halfway would leave half a batch stored.
+
+---
+
+## 4. SDK context and nesting (`sdk/argus/context.py`, `sdk/argus/spans.py`)
+
+**The problem.** When `debate()` calls `turn()` which calls the LLM, each span must know its
+**parent**, without the user passing span objects around by hand.
+
+**How it works**
+
+- One `ContextVar` holds "the current span". A `ContextVar` is like a global variable, but every
+  thread and every asyncio task sees **its own** value.
+- Entering `with argus.span("x")`:
+  1. read the current span → that's the parent (none → this is a root and starts a new trace),
+  2. create the new span with `parent_span_id = parent.span_id` and the parent's `trace_id`,
+  3. `set()` the new span as current, keeping the returned **token**.
+- Leaving the block: `reset(token)` puts the parent back as current, then the span ends and is
+  queued for sending. Spans are sent when they **end**, so children arrive before parents.
+- **Async and concurrent tasks:** `asyncio.gather()` / `create_task()` give each task a **copy**
+  of the context at creation time. Each task starts with the right parent, and spans it opens
+  stay inside that task, so ten concurrent `turn()` calls never adopt each other's children.
+- `@observe` is the same thing wrapped around a function call (sync or `async def`), plus
+  recording the arguments as input and the return value as output.
+- **Errors:** if the block raises, the span gets `status="error"` and the message, and the
+  exception is re-raised unchanged (`__exit__` returns `False`). The SDK never swallows it.
+
+**What would break without it**
+
+- Without `reset(token)`: after the first child ends, it would stay "current", so the next
+  sibling would become its child instead of the parent's (a broken tree).
+- With a plain global variable instead of a `ContextVar`: concurrent tasks would overwrite each
+  other's current span, and children would get random parents from other tasks.
+- If `__exit__` returned `True`: user exceptions would silently disappear, and the app would
+  continue in a broken state. That is the worst thing an observability tool can do.
+- Without wrapping SDK work in `try/except`: a bug in the SDK (say, an unserialisable input)
+  would crash the user's app.
+
+---
+
+## 5. SDK exporter (`sdk/argus/exporter.py`)
+
+**The problem.** Sending spans over HTTP takes milliseconds to seconds, and the server may be down.
+The app being traced must **never** wait for that or crash because of it.
+
+**How it works**
+
+- **Bounded queue.** `enqueue()` only appends to an in-memory `deque` under a lock, taking
+  microseconds and doing no I/O. If the queue holds 10,000 events, the **oldest** is dropped and
+  counted (`argus.get_stats()["dropped"]`).
+- **Background thread.** One daemon thread wakes up when 100 events are waiting, or every
+  1 second, takes a batch (max 100 events and ~4 MB, under the server's 5 MB limit) and POSTs it.
+- **Retries.** On a network error or 5xx, it retries up to 5 times with **exponential backoff +
+  jitter**: wait a random time between 0 and 0.5 s, then 0 to 1 s, 2 s, 4 s… (capped at 10 s).
+  The randomness spreads out retries, so 1,000 clients don't all hit a recovering server at the
+  same instant. **No retry on 4xx**: a bad key or invalid data will fail the same way every time.
+- **Short timeouts** (2 s to connect, 5 s total), so a hanging server can't hold the thread forever.
+- **Flush on exit.** `atexit` calls `shutdown(5 s)`: send what's left, but give up after 5 seconds
+  so a dead server can't stop the program from exiting. `daemon=True` means the thread itself
+  never keeps Python alive.
+- The server's `ON CONFLICT DO NOTHING` (section 3) is what makes these retries safe.
+
+**What would break without it**
+
+- Sending inline in `span.__exit__`: every traced function gets the network latency added. If
+  the server is down, every call waits for a timeout, and the app slows to a crawl.
+- An unbounded queue: during a long outage, memory grows until the app is killed (OOM).
+- Drop-newest or blocking when full: blocking would freeze the app; dropping newest loses the
+  most recent (usually most interesting) data.
+- Retries without jitter: after an outage all clients retry in sync waves and knock the server
+  over again (the "thundering herd").
+- Retrying 4xx: endless pointless requests for data the server will never accept.
+- No `atexit` flush: the last second of spans (often including the root span of the trace!) is
+  lost when a script ends. No time limit on that flush: a dead server hangs program exit.
+- No byte cap on batches: a batch with large inputs exceeds 5 MB, gets 413, and is lost.
+
+---
+
+## 6. `wrap_openai` (`sdk/argus/integrations/openai.py`)
+
+- Replaces `client.chat.completions.create` with a function that opens a `generation` span,
+  calls the original, and records the model, messages, reply and token usage
+  (`usage.prompt_tokens` / `completion_tokens`).
+- Works for `OpenAI` and `AsyncOpenAI` (and Ollama, which speaks the same API). If the original
+  returns a coroutine, the span is finished when that coroutine completes.
+- Without it, every LLM call would need a manual `with argus.span(..., kind="generation")` and
+  hand-written token bookkeeping. Without the "already wrapped" check, wrapping twice would
+  record every call twice.
+
+---
+
+## 7. Redis Stream worker (`server/worker/consumer.py`)
+
+**Why a queue at all?** `POST /v1/ingest` only appends to Redis (fast, ~1 ms) and returns `202`.
+A separate worker writes to Postgres in big batches. A burst of traffic or a slow database then
+makes the queue a bit longer instead of making every client wait or fail.
+
+**Key ideas**
+
+- **Stream:** an append-only log in Redis. `XADD spans * project_id ... span ...` adds one message
+  per span. `MAXLEN ~ 1000000` trims the oldest messages so Redis memory is bounded.
+- **Consumer group `writers`:** several workers can share one stream; each message is delivered
+  to exactly **one** of them (`XREADGROUP ... >` = "give me messages nobody has had yet").
+- **Pending Entries List (PEL):** when a message is delivered, Redis remembers "worker-1 has it,
+  not confirmed yet". It stays there until the worker sends `XACK`.
+
+**The worker loop**
+
+1. `XREADGROUP` up to 500 new messages (wait at most 1 s).
+2. Parse them; `INSERT ... ON CONFLICT (project_id, id) DO NOTHING` all of them in **one**
+   transaction, computing `cost_usd` from `model_prices` in the same statement.
+3. `COMMIT`. **Only then** `XACK` the message IDs.
+4. Every 30 s (and on startup): `XAUTOCLAIM` messages that have been pending on *any* consumer
+   for over 60 s, i.e. a worker that died, and process them as in steps 2-3.
+
+**Why this is crash-safe.** Think about where a worker can die:
+
+| Dies... | Postgres | Redis | What happens next |
+|---|---|---|---|
+| before COMMIT | nothing written (rolled back) | still pending | reclaimed by `XAUTOCLAIM`, stored |
+| after COMMIT, before XACK | rows written | still pending | reclaimed, re-inserted, `ON CONFLICT DO NOTHING` skips them: **no duplicates** |
+| after XACK | rows written | gone | nothing to do |
+
+The test `test_killed_between_commit_and_ack_is_reclaimed_without_duplicates` starts a real
+worker process that hard-exits at exactly the dangerous moment, then checks that another worker
+reclaims the messages and the row count doesn't change. We also killed the live worker with
+`docker kill` during `make traffic N=50`: 1,278 spans sent, exactly 1,278 stored.
+
+**Other details**
+
+- **Postgres down:** nothing is acked; the worker waits (backoff up to 10 s) and retries its
+  *own* pending messages (`XREADGROUP ... 0`) before taking new ones.
+- **Poison messages** (unparseable, or a span for a deleted project): the batch is retried one
+  row at a time, and the bad message goes to the `spans:dead` stream and is acked, so it can't
+  block everything behind it forever.
+- **Cost:** `(input_tokens x input price + output_tokens x output price) / 1,000,000`, using the
+  `model_prices` row with the latest `valid_from` <= the span's `start_time`. No price or no
+  tokens means `NULL` (unknown), which is different from `0` (known to be free, e.g. local
+  Ollama models).
+
+**What would break without it**
+
+- `XACK` **before** the commit: a crash in between loses those spans forever (acked, never
+  stored).
+- No `ON CONFLICT DO NOTHING`: every reclaimed message that had already been committed becomes a
+  duplicate row, doubling costs in the dashboard.
+- No `XAUTOCLAIM`: messages held by a dead worker sit in the PEL forever and are never stored.
+- `XAUTOCLAIM` with a tiny idle time: workers steal each other's in-progress messages (wasted
+  work, though still no duplicate rows).
+- No `MAXLEN`: if the worker is down for days, Redis grows until it runs out of memory.
+  (Trade-off: with `MAXLEN`, a very long outage can trim messages that were never stored.)
+- No dead-letter stream: one bad message would fail its batch on every retry and stop all
+  ingestion.
+- Cost computed at read time from today's price: changing a price would silently rewrite
+  history.

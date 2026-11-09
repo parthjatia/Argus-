@@ -1,0 +1,4 @@
+pydantic>=2.9,<3
+pyyaml>=6,<7
+openai>=1.40,<3   # only used by LLM_PROVIDER=ollama|openai (imported lazily)
+pytest>=8.3,<9
