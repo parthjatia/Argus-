@@ -1,0 +1,56 @@
+{
+  "project": "chaos-20261109-175050",
+  "finished_at": "2026-11-09T17:52:11+00:00",
+  "senders": 6,
+  "spans_per_batch": 20,
+  "send_seconds": 75.1,
+  "drained_after_seconds": 77.5,
+  "chaos_events": [
+    [
+      11.0,
+      "worker SIGKILL"
+    ],
+    [
+      16.4,
+      "worker start"
+    ],
+    [
+      26.8,
+      "server graceful restart"
+    ],
+    [
+      40.9,
+      "server SIGKILL"
+    ],
+    [
+      45.2,
+      "server start"
+    ],
+    [
+      52.7,
+      "worker + server SIGKILL"
+    ],
+    [
+      58.2,
+      "worker + server start"
+    ],
+    [
+      66.0,
+      "worker graceful restart"
+    ]
+  ],
+  "requests": 4497,
+  "retried_requests": 96,
+  "network_errors": 96,
+  "server_5xx": 0,
+  "client_4xx": 0,
+  "deliberate_duplicate_batches": 424,
+  "spans_accepted_unique": 88020,
+  "rows_stored": 88020,
+  "distinct_ids_stored": 88020,
+  "missing": 0,
+  "unexpected": 0,
+  "duplicates": 0,
+  "redis_pending_after": 0,
+  "passed": true
+}

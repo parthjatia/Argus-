@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.api.ingest import router as ingest_router
+from app.api.metrics import router as metrics_router
+from app.api.traces import router as traces_router
 from app.config import get_settings
 from app.db import create_pool
 
@@ -42,6 +44,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(title="Argus", version="0.1.0", lifespan=lifespan)
 app.include_router(ingest_router)
+app.include_router(traces_router)
+app.include_router(metrics_router)
 
 
 @app.exception_handler(psycopg.OperationalError)

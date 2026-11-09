@@ -86,7 +86,11 @@ argus/
 │   ├── worker/consumer.py    # Redis Stream → Postgres batch writer
 │   ├── migrations/           # plain SQL files, applied in order (0002 = example prices)
 │   └── tests/
-├── dashboard/                # Next.js app
+├── dashboard/                # Next.js 15 (App Router) + Tailwind 4 + Recharts 3
+│   ├── app/traces/           # list (filters, cursor paging) + [id] waterfall page
+│   ├── app/metrics/          # cost / latency / error-rate page
+│   ├── components/           # TraceView (waterfall + span detail), charts, badges
+│   └── lib/                  # api.ts (server-side client), tree.ts, format.ts (+ tests)
 ├── demo/                     # Docker image built from the repo root (needs ../sdk)
 │   ├── arena/
 │   │   ├── debate.py         # one debate = one trace (python -m arena.debate)
@@ -97,7 +101,7 @@ argus/
 │   ├── topics.yaml
 │   ├── traffic.py            # runs many debates to generate traces
 │   └── tests/
-└── loadtest/
+└── loadtest/                # ingest.js (k6), run_load.py, chaos.py, results/
 ```
 
 ---
@@ -274,7 +278,8 @@ make demo TOPIC="..."             # one debate (LLM_PROVIDER from .env, default 
 make traffic N=50                 # run many debates
 make test                         # pytest for sdk + server
 make lint                         # ruff
-make load                         # load test the ingestion API
+make load                         # k6 load test of the ingestion API (VUS=20 DURATION=30s)
+make chaos                        # kill/restart worker + API during traffic, check exactly-once
 ```
 
 ---
@@ -288,10 +293,11 @@ make load                         # load test the ingestion API
 - [x] SDK: queue overflow drops oldest events and counts them
 - [x] Server: invalid API key → 401; invalid batch → 422
 - [x] Server: the same batch sent twice → each span stored once
-- [x] Server: a child span arriving before its parent is stored (shown correctly: dashboard, Milestone 4)
+- [x] Server: a child span arriving before its parent is stored and shown correctly (`buildTree` marks it "parent missing")
 - [x] Worker: killed mid-batch → messages are reclaimed and stored, no duplicates
-- [ ] End-to-end: `make demo` produces a complete trace visible in the dashboard
-- [ ] Load test: record events/second and p95 ingest latency in the README
+- [x] End-to-end: `make demo` produces a complete trace visible in the dashboard
+- [x] Load test: record events/second and p95 ingest latency in the README
+- [x] Chaos: traffic while killing/restarting worker and API → every accepted span stored exactly once
 
 ---
 
@@ -359,6 +365,19 @@ make load                         # load test the ingestion API
 | LLM timeouts retried once per call; a turn that still fails is recorded and the debate continues; a failed judge fails the debate | A realistic mix of partial failures and failed traces |  |
 | `traffic.py` uses threads | Each thread starts with an empty context, so each debate is its own trace |  |
 | Demo dependencies: PyYAML (topics), `openai` (only for ollama/openai, imported lazily) | Well-known; the fake provider needs no network or API key |  |
+| Read API uses the same `X-API-Key` auth; the dashboard calls it only from server components with `ARGUS_API_KEY` from its env | One auth mechanism; the key never reaches the browser | The dashboard shows a single project (the key's) |
+| Trace status = root span status (fallback: any span failed while the root is missing) | A trace that recovered from a failed child is a success; failed children are counted separately | `status=error` filters on the root, not on "any error" |
+| Keyset pagination on `(start_time, trace_id)`, opaque base64 cursor, `limit + 1` probe | Stable pages while new traces keep arriving; no `OFFSET` scans | Only "next" and "first page" navigation |
+| Trace summaries are aggregated from `spans` on every list request | Simplest correct design (see schema notes); no summary table to keep consistent | Cost grows with a project's span count; add a `traces` table only if it gets slow |
+| Error rate per bucket uses `generate_series` to fill empty buckets; empty = `null`, not 0% | No misleading gaps or fake zeros | Hourly over 30 days = 720 points (the UI switches to daily buckets above 7 days) |
+| Dashboard: filters are a plain GET form (state in the URL) | Shareable links, back button works, no client state | Full page reload on Apply |
+| Chart colours: reference palette slots, assigned by the sorted list of models seen in the last 90 days; > 8 models fold into "Other" | A model keeps its colour when the time range changes (colour follows the entity) | One extra metrics query |
+| Latency per model drawn as HTML bars (p50 solid, to p95 lighter) instead of a chart | Two percentiles per model with model colours, no clash with the cost chart's colours |  |
+| Dashboard unit tests use `node --test` with type stripping (no Jest/Vitest) | No extra dependency; runs in plain `node:22-alpine` | Tested modules must use erasable TypeScript only |
+| Next.js `output: "standalone"` image; `npm test` + `next build` (type-check) gate the image build | Small runtime image; a broken tree builder or type error fails `up` | Dashboard code changes need an image rebuild |
+| Load test = k6 in Docker on the compose network (`grafana/k6:0.54.0`), driven by `loadtest/run_load.py`; each run uses a fresh project | No host install; per-run project makes stored-row counts exact; measures both ingest (client view) and worker drain rate | k6 shares the machine's CPUs with the system under test |
+| Chaos and load drivers are stdlib-only Python on the host | They must run `docker compose kill/start`; no extra dependencies | Need Python 3.12 on the host |
+| API process count via `WEB_CONCURRENCY` (read by uvicorn), default 1 | Scale ingest without code changes (measured 9.1k → 21.9k spans/s with 4) | Each process has its own DB pool (max 10 connections) |
 | `/health` returns `503` when Postgres or Redis is unreachable | Load balancers and `docker compose` healthchecks react to the status code, not the body | The body says which dependency failed, but details stay in server logs |
 | Dev server image includes pytest + ruff; repo mounted at `/repo` | `make test` / `make lint` only need Docker on the host, same environment for everyone | Image is larger than a production image; a slim prod image is a later step |
 | Send spans when they end, not start + end events | Simpler protocol, one row per span | Long-running spans are invisible until they finish |

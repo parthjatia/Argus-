@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+/* Design tokens. Charts and UI reference roles, never raw hex, so dark mode swaps here.
+   Series + status colours: the validated reference palette (dataviz skill). */
+:root {
+  color-scheme: light;
+  --surface-0: #f4f4f1; /* page */
+  --surface-1: #fcfcfb; /* cards, chart surface */
+  --surface-2: #efeeea; /* hover, tracks */
+  --border: #e2e1dc;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #7a7974;
+  --accent: #2a78d6;
+
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #6250d6;
+  --series-8: #e34948;
+  --series-other: #a3a29c;
+
+  --status-good: #0ca30c;
+  --status-critical: #d03b3b;
+  --status-critical-bg: #fbeaea;
+
+  /* Span kinds = the first three slots (validated all-pairs). */
+  --kind-span: var(--series-1);
+  --kind-generation: var(--series-2);
+  --kind-tool: var(--series-3);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #262624;
+    --border: #33332f;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e86;
+    --accent: #3987e5;
+
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
+    --series-other: #6d6c66;
+
+    --status-critical-bg: #3a1d1d;
+  }
+}
+
+@theme inline {
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-ink: var(--text-primary);
+  --color-ink-2: var(--text-secondary);
+  --color-ink-3: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-good: var(--status-good);
+  --color-critical: var(--status-critical);
+  --color-critical-bg: var(--status-critical-bg);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+}
+
+body {
+  background: var(--surface-0);
+  color: var(--text-primary);
+}
+
+/* Inputs share one look. */
+.field {
+  @apply h-9 rounded-md border border-border bg-surface-1 px-2.5 text-sm text-ink
+    outline-none focus:border-accent focus:ring-2 focus:ring-accent/25;
+}

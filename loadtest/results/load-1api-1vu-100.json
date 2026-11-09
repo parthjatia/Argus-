@@ -1,0 +1,22 @@
+{
+  "finished_at": "2026-11-09T17:56:00+00:00",
+  "vus": 1,
+  "spans_per_batch": 100,
+  "duration": "30s",
+  "requests": 1454,
+  "requests_per_s": 27.7,
+  "spans_accepted": 145400,
+  "api_processes": 1,
+  "ingest_spans_per_s": 2769.0,
+  "latency_ms": {
+    "med": 11.2,
+    "p(95)": 17.2,
+    "p(99)": 27.4,
+    "max": 58.0
+  },
+  "failed_checks": 0,
+  "stored_when_k6_ended": 101300,
+  "stored": 145400,
+  "worker_spans_per_s": 2184.0,
+  "drain_after_k6_s": 14.0
+}

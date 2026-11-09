@@ -1,5 +1,4 @@
 # Local development stack. Copy .env.example to .env first.
-# Later milestones add: dashboard.
 
 services:
   postgres:
@@ -38,6 +37,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       STREAM_MAXLEN: ${STREAM_MAXLEN:-1000000}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}  # uvicorn worker processes (read by uvicorn)
     ports:
       - "8000:8000"
     # Mount the whole repo so code edits are visible without a rebuild and
@@ -69,6 +69,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # Next.js dashboard. Calls the read API server-side with ARGUS_API_KEY (never sent to browsers).
+  dashboard:
+    build: ./dashboard
+    environment:
+      ARGUS_API_URL: http://server:8000
+      ARGUS_API_KEY: ${ARGUS_API_KEY:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - server
 
   # Debate Arena. Not started by `up` (profile); used via `make demo` / `make traffic`.
   demo:

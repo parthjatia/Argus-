@@ -246,3 +246,33 @@ reclaims the messages and the row count doesn't change. We also killed the live 
   ingestion.
 - Cost computed at read time from today's price: changing a price would silently rewrite
   history.
+
+---
+
+## 8. Read path: traces at read time, tree in the browser (`server/app/api/traces.py`, `dashboard/lib/tree.ts`)
+
+**How it works**
+
+- There is no `traces` table. `GET /v1/traces` groups `spans` by `trace_id` and computes each
+  trace's start, duration, cost, models and status on the fly. The trace's **status is its root
+  span's status**: a debate that recovered from a failed tool call is still "ok" (the list shows
+  the failed-span count separately).
+- **Keyset (cursor) pagination:** each page ends with a cursor = (start_time, trace_id) of its
+  last row; the next page asks for rows *strictly before* that pair. We fetch `limit + 1` rows to
+  know whether another page exists.
+- `GET /v1/traces/{id}` returns the spans **flat**. The dashboard's `buildTree()` links each span
+  to its parent and walks the tree depth-first to draw the waterfall.
+- Because `parent_span_id` has no foreign key, a child can be stored before its parent. The tree
+  builder shows such a span at the top level marked "parent missing", never hides it, and never
+  loops on bad data (cycles).
+- The dashboard calls the API from **server components** with the API key from its own
+  environment, so the key never reaches the browser.
+
+**What would break without it**
+
+- `OFFSET` pagination instead of a cursor: while traces keep arriving, rows shift between
+  pages, so you'd see duplicates or skip traces.
+- Without the `project_id` filter in every query: one project could read another's traces.
+- A tree builder that drops spans with unknown parents: traces still in flight would look
+  incomplete, and a lost parent would hide all of its children.
+- Calling the API from the browser with the key: anyone opening devtools could copy it.
