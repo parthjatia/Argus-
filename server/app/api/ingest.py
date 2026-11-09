@@ -19,7 +19,7 @@ from redis.asyncio import Redis
 from app.auth import require_project
 from app.config import get_settings
 from app.schemas import IngestBatch, IngestResponse
-from app.streams import STREAM, get_redis
+from app.streams import RATE_TTL_S, STREAM, get_redis, rate_key
 
 logger = logging.getLogger("argus.ingest")
 
@@ -89,6 +89,9 @@ async def ingest(
                 maxlen=maxlen,
                 approximate=True,
             )
+        counter = rate_key("ingested")
+        pipe.incrby(counter, len(batch.batch))
+        pipe.expire(counter, RATE_TTL_S)
         await pipe.execute()
 
     logger.debug("ingest project=%s queued=%d", project_id, len(batch.batch))

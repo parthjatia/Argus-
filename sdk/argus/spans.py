@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Literal
 from uuid import uuid4
 
 from argus import client
-from argus.context import _current_span, current_span
+from argus.context import _attributes, _current_span, current_attributes, current_span
 from argus.models import SpanEvent
 from argus.serialize import to_jsonable
 
@@ -54,7 +56,8 @@ class Span:
         self.output: Any = None
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
-        self.metadata: dict[str, Any] = {}
+        # Inherited attributes first; the span's own set_metadata() calls override them.
+        self.metadata: dict[str, Any] = dict(current_attributes())
         self._size = 0
         self._input_size = 0
         self._output_size = 0
@@ -182,3 +185,22 @@ def span(
 ) -> _SpanContext:
     """Trace a block of code: `with argus.span("retrieve", kind="tool") as s: ...`."""
     return _SpanContext(name, kind, input, metadata, model)
+
+
+@contextmanager
+def attributes(**values: Any) -> Iterator[None]:
+    """Add `values` to the metadata of every span created inside this block.
+
+        with argus.attributes(topic="AI safety", role="pro"):
+            ...  # spans opened here (also by wrap_openai) carry topic + role
+
+    Nests (inner values win), follows asyncio tasks like the current span, and doesn't
+    change spans that already exist. Values must be JSON-friendly; others are converted.
+    """
+    safe, _ = to_jsonable(values, client.max_payload_bytes())
+    merged = {**current_attributes(), **(safe if isinstance(safe, dict) else {})}
+    token = _attributes.set(MappingProxyType(merged))
+    try:
+        yield
+    finally:
+        _attributes.reset(token)

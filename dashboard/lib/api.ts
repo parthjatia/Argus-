@@ -2,7 +2,22 @@
 // Only imported by server components: the API key comes from the dashboard's environment
 // (ARGUS_API_KEY) and is never sent to the browser.
 
-import type { CostPoint, ErrorPoint, LatencyRow, TraceDetail, TraceList } from "./types.ts";
+import type {
+  BreakdownRow,
+  CostPoint,
+  ErrorPoint,
+  LatencyRow,
+  LiveTrace,
+  ModelCostPoint,
+  ModelStats,
+  RecentSpan,
+  SeriesPoint,
+  Summary,
+  SystemStatus,
+  TraceDetail,
+  TraceList,
+} from "./types.ts";
+import type { Window } from "./range.ts";
 
 export class ApiError extends Error {
   status: number;
@@ -47,4 +62,17 @@ export const api = {
   latency: (days: number) => get<LatencyRow[]>("/v1/metrics/latency", { days }),
   errors: (days: number, bucket: "hour" | "day") =>
     get<ErrorPoint[]>("/v1/metrics/errors", { days, bucket }),
+
+  // control room
+  live: () => get<LiveTrace[]>("/v1/traces/live", { window_s: 60 }),
+  recentSpans: (limit = 40) => get<RecentSpan[]>("/v1/spans/recent", { limit }),
+  summary: (w: Window) => get<Summary>("/v1/metrics/summary", { start: w.start, end: w.end }),
+  timeseries: (w: Window, bucketS = w.bucketS) =>
+    get<SeriesPoint[]>("/v1/metrics/timeseries", { start: w.start, end: w.end, bucket_s: bucketS }),
+  costByModel: (w: Window, bucketS = w.bucketS) =>
+    get<ModelCostPoint[]>("/v1/metrics/cost_by_model", { start: w.start, end: w.end, bucket_s: bucketS }),
+  models: (w: Window) => get<ModelStats[]>("/v1/metrics/models", { start: w.start, end: w.end }),
+  breakdown: (w: Window, attribute: string) =>
+    get<BreakdownRow[]>("/v1/metrics/breakdown", { start: w.start, end: w.end, attribute }),
+  system: (minutes = 30) => get<SystemStatus>("/v1/system", { minutes }),
 };

@@ -1,231 +1,308 @@
-import Link from "next/link";
+import { Suspense } from "react";
 import { api } from "@/lib/api";
 import { OTHER, modelColors, seriesName } from "@/lib/colors";
 import { formatCost, formatDuration, formatTokens } from "@/lib/format";
-import { Card, ErrorState, PageTitle, Stat } from "@/components/ui";
-import { CostChart, ErrorRateChart, Legend, type CostRow, type ErrorRow } from "@/components/charts";
+import { bucketLabel, bucketStarts, parseRange, rangeWindow, type Window } from "@/lib/range";
+import { ErrorStepLine, HBars, Legend, TimeBars, type TimeRow } from "@/components/charts";
+import { Empty, PageHeader, Panel, PanelError, PanelSkeleton, Td, Th, Tile, TileSkeleton } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
-const DAY_OPTIONS = [1, 7, 14, 30];
+type SP = Promise<Record<string, string | undefined>>;
 
-export default async function MetricsPage({ searchParams }: { searchParams: Promise<Record<string, string | undefined>> }) {
-  const sp = await searchParams;
-  const days = DAY_OPTIONS.includes(Number(sp.days)) ? Number(sp.days) : 7;
-  const bucket = days <= 7 ? "hour" : "day";
-
-  let data;
-  try {
-    const [cost, latency, errors, allCost] = await Promise.all([
-      api.cost(days),
-      api.latency(days),
-      api.errors(days, bucket),
-      api.cost(90), // stable model → colour mapping, independent of the selected range
-    ]);
-    data = { cost, latency, errors, allModels: allCost.map((c) => c.model) };
-  } catch (error) {
-    return (
-      <>
-        <PageTitle title="Metrics" />
-        <ErrorState error={error} />
-      </>
-    );
-  }
-
-  const colors = modelColors([...data.allModels, ...data.cost.map((c) => c.model), ...data.latency.map((l) => l.model)]);
-
-  // cost: pivot [{day, model, cost}] → [{day, modelA: $, modelB: $}]
-  const seriesNames = [...new Set(data.cost.map((c) => seriesName(c.model, colors)))].sort((a, b) =>
-    a === OTHER ? 1 : b === OTHER ? -1 : a.localeCompare(b),
-  );
-  const byDay = new Map<string, CostRow>();
-  for (const c of data.cost) {
-    const key = c.day.slice(0, 10); // YYYY-MM-DD (API buckets are UTC midnights)
-    const row = byDay.get(key) ?? { day: c.day };
-    const name = seriesName(c.model, colors);
-    row[name] = (Number(row[name]) || 0) + (c.cost_usd ?? 0);
-    byDay.set(key, row);
-  }
-  // Every day of the range gets a slot (zero if no calls), so bars sit on a real time axis.
-  const today = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
-  const costRows: CostRow[] = Array.from({ length: days }, (_, i) => {
-    const day = new Date(today - (days - 1 - i) * 86_400_000).toISOString();
-    const row: CostRow = { day, ...(byDay.get(day.slice(0, 10)) ?? {}) };
-    row.day = day;
-    for (const n of seriesNames) row[n] ??= 0;
-    return row;
-  });
-  const series = seriesNames.map((name) => ({ name, color: colors.get(name)! }));
-
-  const errorRows: ErrorRow[] = data.errors.map((e) => ({
-    bucket: e.bucket,
-    rate: e.error_rate === null ? null : e.error_rate * 100,
-    traces: e.traces,
-    errors: e.trace_errors,
-  }));
-
-  const totalCost = data.cost.reduce((a, c) => a + (c.cost_usd ?? 0), 0);
-  const unpriced = data.cost.filter((c) => c.cost_usd === null).reduce((a, c) => a + c.calls, 0);
-  const calls = data.cost.reduce((a, c) => a + c.calls, 0);
-  const tokens = data.cost.reduce((a, c) => a + c.input_tokens + c.output_tokens, 0);
-  const traces = data.errors.reduce((a, e) => a + e.traces, 0);
-  const failed = data.errors.reduce((a, e) => a + e.trace_errors, 0);
-  const maxP95 = Math.max(1, ...data.latency.map((l) => l.p95_ms));
-
+export default async function MetricsPage({ searchParams }: { searchParams: SP }) {
+  const w = rangeWindow(parseRange((await searchParams).range));
   return (
     <>
-      <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
-        <PageTitle title="Metrics" subtitle="Cost and latency of LLM calls, and how often traces fail. Times in UTC." />
-        <nav aria-label="Time range" className="flex rounded-md border border-border bg-surface-1 p-0.5 text-sm">
-          {DAY_OPTIONS.map((d) => (
-            <Link
-              key={d}
-              href={`/metrics?days=${d}`}
-              aria-current={d === days ? "page" : undefined}
-              className={`rounded px-3 py-1 ${d === days ? "bg-surface-2 font-medium text-ink" : "text-ink-2 hover:text-ink"}`}
-            >
-              {d === 1 ? "24h" : `${d}d`}
-            </Link>
-          ))}
-        </nav>
-      </div>
-
-      <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Stat label="Total cost" value={formatCost(totalCost)} hint={unpriced ? `${unpriced} call(s) without a price` : undefined} />
-        <Stat label="LLM calls" value={calls.toLocaleString("en")} hint={`${formatTokens(tokens)} tokens`} />
-        <Stat label="Traces" value={traces.toLocaleString("en")} />
-        <Stat
-          label="Trace error rate"
-          value={traces ? `${((failed / traces) * 100).toFixed(1)}%` : "–"}
-          hint={traces ? `${failed} failed` : undefined}
-        />
-      </div>
-
-      <Card className="mb-4 p-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-sm font-medium">Cost per day, by model</h2>
-          {series.length > 1 && <Legend items={series.map((s) => ({ label: s.name, color: s.color }))} />}
-        </div>
-        {data.cost.length ? <CostChart rows={costRows} series={series} /> : <Empty />}
-        <DataTable
-          head={["Day", "Model", "Calls", "Tokens", "Cost"]}
-          rows={data.cost.map((c) => [
-            c.day.slice(0, 10),
-            c.model,
-            String(c.calls),
-            formatTokens(c.input_tokens + c.output_tokens),
-            formatCost(c.cost_usd),
-          ])}
-        />
-      </Card>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Card className="p-4">
-          <h2 className="text-sm font-medium">LLM latency per model</h2>
-          <p className="mt-0.5 mb-3 text-xs text-ink-3">
-            Bar: median (p50), lighter extension: up to p95. One scale for all rows.
-          </p>
-          {data.latency.length ? (
-            <ul className="space-y-3">
-              {data.latency.map((l) => {
-                const color = colors.get(l.model) ?? "var(--series-other)";
-                return (
-                  <li key={l.model} className="grid grid-cols-[minmax(0,9rem)_1fr] items-center gap-3 text-sm">
-                    <div className="min-w-0">
-                      <p className="flex items-center gap-1.5 truncate font-mono text-xs">
-                        <span aria-hidden className="size-2.5 shrink-0 rounded-sm" style={{ background: color }} />
-                        {l.model}
-                      </p>
-                      <p className="text-xs text-ink-3">{l.calls} calls</p>
-                    </div>
-                    <div>
-                      <div
-                        className="relative h-3 rounded-[4px] bg-surface-2"
-                        title={`${l.model}: p50 ${formatDuration(l.p50_ms)}, p95 ${formatDuration(l.p95_ms)}`}
-                      >
-                        <span
-                          className="absolute inset-y-0 left-0 rounded-[4px] opacity-35"
-                          style={{ width: `${(l.p95_ms / maxP95) * 100}%`, background: color }}
-                        />
-                        <span
-                          className="absolute inset-y-0 left-0 rounded-[4px]"
-                          style={{ width: `${(l.p50_ms / maxP95) * 100}%`, background: color }}
-                        />
-                      </div>
-                      <p className="mt-1 flex justify-between text-xs text-ink-2 tabular-nums">
-                        <span>p50 {formatDuration(l.p50_ms)}</span>
-                        <span>p95 {formatDuration(l.p95_ms)}</span>
-                      </p>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          ) : (
-            <Empty />
-          )}
-        </Card>
-
-        <Card className="p-4">
-          <h2 className="text-sm font-medium">Trace error rate</h2>
-          <p className="mt-0.5 mb-3 text-xs text-ink-3">
-            Share of traces whose root span failed, per {bucket}. Gaps = no traces.
-          </p>
-          {traces ? <ErrorRateChart rows={errorRows} bucket={bucket} /> : <Empty />}
-          <DataTable
-            head={[bucket === "hour" ? "Hour" : "Day", "Traces", "Failed", "Error rate"]}
-            rows={data.errors
-              .filter((e) => e.traces > 0)
-              .map((e) => [
-                e.bucket.slice(0, bucket === "hour" ? 13 : 10).replace("T", " ") + (bucket === "hour" ? ":00" : ""),
-                String(e.traces),
-                String(e.trace_errors),
-                e.error_rate === null ? "–" : `${(e.error_rate * 100).toFixed(1)}%`,
-              ])}
-          />
-        </Card>
-      </div>
+      <PageHeader title="Metrics">
+        <span>
+          LLM cost, latency, tokens and errors in the last <span className="num text-ink">{w.range}</span>. Buckets are
+          UTC-aligned.
+        </span>
+      </PageHeader>
+      <Suspense fallback={<MetricsSkeleton />}>
+        <MetricsBody w={w} />
+      </Suspense>
     </>
   );
 }
 
-function Empty() {
+function MetricsSkeleton() {
   return (
-    <p className="grid h-40 place-items-center text-sm text-ink-3">
-      No data in this range yet. Try <code className="mx-1 font-mono">make traffic N=50</code>.
-    </p>
+    <div className="grid gap-2">
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
+        {["Cost", "LLM calls", "Tokens", "p95 latency", "LLM error rate"].map((l) => (
+          <TileSkeleton key={l} label={l} />
+        ))}
+      </div>
+      <PanelSkeleton title="Cost over time, by model" rows={8} />
+      <div className="grid gap-2 lg:grid-cols-2">
+        <PanelSkeleton title="Latency per model" />
+        <PanelSkeleton title="Error rate" />
+      </div>
+    </div>
   );
 }
 
-function DataTable({ head, rows }: { head: string[]; rows: string[][] }) {
-  if (!rows.length) return null;
+// "Cost per day" for 7 days; shorter ranges use their own bucket so the chart isn't one bar.
+function costBucket(w: Window): number {
+  return w.range === "7d" ? 86_400 : w.bucketS;
+}
+
+async function MetricsBody({ w }: { w: Window }) {
+  // Each panel fails on its own: one rejected request shows an error in that panel only.
+  const [cost, models, series, roles, allModels] = await Promise.allSettled([
+    api.costByModel(w, costBucket(w)),
+    api.models(w),
+    api.timeseries(w),
+    api.breakdown(w, "role"),
+    api.models({ ...w, start: new Date(Date.now() - 90 * 86_400_000).toISOString() }), // stable colours
+  ]);
+
+  const known = allModels.status === "fulfilled" ? allModels.value.map((m) => m.model) : [];
+  const colors = modelColors([
+    ...known,
+    ...(models.status === "fulfilled" ? models.value.map((m) => m.model) : []),
+    ...(cost.status === "fulfilled" ? cost.value.map((c) => c.model) : []),
+  ]);
+  const color = (m: string) => colors.get(seriesName(m, colors)) ?? "var(--series-other)";
+
   return (
-    <details className="mt-3 text-xs">
-      <summary className="cursor-pointer text-ink-3 hover:text-ink-2">Show data table</summary>
-      <div className="mt-2 max-h-64 overflow-auto">
-        <table className="w-full tabular-nums">
-          <thead className="text-left text-ink-3">
-            <tr>
-              {head.map((h, i) => (
-                <th key={h} className={`py-1 pr-3 font-medium ${i > 1 ? "text-right" : ""}`}>
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="text-ink-2">
-            {rows.map((r, i) => (
-              <tr key={i} className="border-t border-border">
-                {r.map((c, j) => (
-                  <td key={j} className={`py-1 pr-3 ${j > 1 ? "text-right" : ""}`}>
-                    {c}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    <div className="grid gap-2">
+      {models.status === "fulfilled" ? <Tiles models={models.value} /> : <Panel title="Totals"><PanelError error={models.reason} /></Panel>}
+
+      <Panel
+        title={`Cost per ${bucketLabel(costBucket(w))}, by model`}
+        right={cost.status === "fulfilled" ? <CostLegend models={cost.value.map((c) => c.model)} colors={colors} /> : null}
+      >
+        <div className="p-2">
+          {cost.status === "rejected" ? (
+            <PanelError error={cost.reason} />
+          ) : cost.value.length === 0 ? (
+            <Empty>No LLM calls in this range.</Empty>
+          ) : (
+            <CostChart rows={cost.value} w={w} colors={colors} />
+          )}
+        </div>
+      </Panel>
+
+      <div className="grid gap-2 lg:grid-cols-3">
+        <Panel title="Cost per debate role" right={<span>metadata.role</span>}>
+          <div className="p-2.5">
+            {roles.status === "rejected" ? (
+              <PanelError error={roles.reason} />
+            ) : roles.value.length === 0 ? (
+              <Empty>No LLM calls in this range.</Empty>
+            ) : (
+              <HBars
+                format="cost"
+                rows={roles.value.map((r) => ({
+                  key: r.value ?? "none",
+                  label: r.value ?? "(no role: older traces)",
+
+                  segments: [{ value: r.cost_usd ?? 0, color: r.value === "judge" ? "var(--series-2)" : "var(--accent)", label: "cost" }],
+                  note: `${formatCost(r.cost_usd)} · ${r.calls}`,
+                }))}
+              />
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Latency per model" right={<span>bar p50 · light to p95</span>}>
+          <div className="p-2.5">
+            {models.status === "rejected" ? (
+              <PanelError error={models.reason} />
+            ) : models.value.length === 0 ? (
+              <Empty>No LLM calls in this range.</Empty>
+            ) : (
+              <LatencyBars models={models.value} color={color} />
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Tokens per model" right={<Legend items={[{ label: "input", color: "var(--accent)" }, { label: "output", color: "var(--series-2)" }]} />}>
+          <div className="p-2.5">
+            {models.status === "rejected" ? (
+              <PanelError error={models.reason} />
+            ) : models.value.length === 0 ? (
+              <Empty>No LLM calls in this range.</Empty>
+            ) : (
+              <HBars
+                format="tokens"
+                rows={models.value.map((m) => ({
+                  key: m.model,
+                  label: m.model,
+                  segments: [
+                    { value: m.input_tokens, color: "var(--accent)", label: "input" },
+                    { value: m.output_tokens, color: "var(--series-2)", label: "output" },
+                  ],
+                }))}
+              />
+            )}
+          </div>
+        </Panel>
       </div>
-    </details>
+
+      <Panel title={`Trace error rate per ${w.bucketLabel}`} right={<span>failed root spans / traces · gaps = no traces</span>}>
+        <div className="p-2">
+          {series.status === "rejected" ? (
+            <PanelError error={series.reason} />
+          ) : !series.value.some((r) => r.traces) ? (
+            <Empty>No finished traces in this range.</Empty>
+          ) : (
+            <ErrorStepLine
+              bucketS={w.bucketS}
+              rows={series.value.map((r) => ({
+                bucket: r.bucket,
+                rate: r.error_rate === null ? null : r.error_rate * 100,
+                traces: r.traces,
+                errors: r.trace_errors,
+              }))}
+            />
+          )}
+        </div>
+      </Panel>
+
+      <Panel title="Model comparison">
+        {models.status === "rejected" ? (
+          <PanelError error={models.reason} />
+        ) : models.value.length === 0 ? (
+          <Empty>No LLM calls in this range.</Empty>
+        ) : (
+          <ModelTable models={models.value} color={color} />
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+type Models = Awaited<ReturnType<typeof api.models>>;
+
+function Tiles({ models }: { models: Models }) {
+  const calls = models.reduce((a, m) => a + m.calls, 0);
+  const errors = models.reduce((a, m) => a + m.errors, 0);
+  const cost = models.reduce<number | null>((a, m) => (m.cost_usd === null ? a : (a ?? 0) + m.cost_usd), null);
+  const tokens = models.reduce((a, m) => a + m.input_tokens + m.output_tokens, 0);
+  const p95 = Math.max(0, ...models.map((m) => m.p95_ms));
+  const unpriced = models.filter((m) => m.cost_usd === null).map((m) => m.model);
+  return (
+    <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
+      <Tile label="Cost" value={formatCost(cost)} hint={unpriced.length ? `no price: ${unpriced.join(", ")}` : "all models priced"} />
+      <Tile label="LLM calls" value={calls.toLocaleString("en")} hint={`${models.length} model(s)`} />
+      <Tile label="Tokens" value={formatTokens(tokens)} />
+      <Tile label="p95 latency" value={calls ? formatDuration(p95) : "–"} tone={p95 >= 2000 ? "warning" : "normal"} hint="slowest model" />
+      <Tile
+        label="LLM error rate"
+        value={calls ? `${((errors / calls) * 100).toFixed(1)}%` : "–"}
+        tone={errors ? "critical" : "normal"}
+        hint={`${errors} failed calls`}
+      />
+    </div>
+  );
+}
+
+function CostLegend({ models, colors }: { models: string[]; colors: Map<string, string> }) {
+  const names = [...new Set(models.map((m) => seriesName(m, colors)))].sort((a, b) => (a === OTHER ? 1 : b === OTHER ? -1 : a.localeCompare(b)));
+  return <Legend items={names.map((n) => ({ label: n, color: colors.get(n)! }))} />;
+}
+
+function CostChart({ rows, w, colors }: { rows: Awaited<ReturnType<typeof api.costByModel>>; w: Window; colors: Map<string, string> }) {
+  const bucketS = costBucket(w);
+  const names = [...new Set(rows.map((c) => seriesName(c.model, colors)))].sort((a, b) =>
+    a === OTHER ? 1 : b === OTHER ? -1 : a.localeCompare(b),
+  );
+  const byBucket = new Map<number, TimeRow>();
+  for (const c of rows) {
+    const key = Date.parse(c.bucket);
+    const row = byBucket.get(key) ?? { bucket: c.bucket };
+    const name = seriesName(c.model, colors);
+    row[name] = (Number(row[name]) || 0) + (c.cost_usd ?? 0);
+    byBucket.set(key, row);
+  }
+  // Every bucket of the range gets a slot, so bars sit on a real time axis.
+  const filled = bucketStarts({ ...w, bucketS }).map((b) => {
+    const row: TimeRow = { ...(byBucket.get(Date.parse(b)) ?? {}), bucket: b };
+    for (const n of names) row[n] ??= 0;
+    return row;
+  });
+  return (
+    <TimeBars
+      rows={filled}
+      bucketS={bucketS}
+      series={names.map((n) => ({ key: n, label: n, color: colors.get(n)! }))}
+      format="cost"
+      height={200}
+    />
+  );
+}
+
+function LatencyBars({ models, color }: { models: Models; color: (m: string) => string }) {
+  const max = Math.max(1, ...models.map((m) => m.p95_ms));
+  return (
+    <ul className="space-y-2">
+      {models.map((m) => (
+        <li key={m.model} className="text-xs">
+          <p className="mb-0.5 flex justify-between font-mono text-[11px]">
+            <span className="flex items-center gap-1.5">
+              <span aria-hidden className="inline-block size-2" style={{ background: color(m.model) }} />
+              {m.model}
+            </span>
+            <span className={`num ${m.p95_ms >= 2000 ? "text-warning" : "text-ink-2"}`}>
+              p50 {formatDuration(m.p50_ms)} · p95 {formatDuration(m.p95_ms)}
+            </span>
+          </p>
+          <span className="relative block h-3 bg-surface-2" title={`${m.model}: p50 ${formatDuration(m.p50_ms)}, p95 ${formatDuration(m.p95_ms)}`}>
+            <span className="absolute inset-y-0 left-0 opacity-35" style={{ width: `${(m.p95_ms / max) * 100}%`, background: color(m.model) }} />
+            <span className="absolute inset-y-0 left-0" style={{ width: `${(m.p50_ms / max) * 100}%`, background: color(m.model) }} />
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ModelTable({ models, color }: { models: Models; color: (m: string) => string }) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[820px] text-xs">
+        <thead>
+          <tr>
+            <Th>Model</Th>
+            <Th num>Calls</Th>
+            <Th num>Errors</Th>
+            <Th num>Error rate</Th>
+            <Th num>Avg latency</Th>
+            <Th num>p50</Th>
+            <Th num>p95</Th>
+            <Th num>Input tok</Th>
+            <Th num>Output tok</Th>
+            <Th num>Total cost</Th>
+            <Th num>Avg cost / call</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map((m) => (
+            <tr key={m.model} className="border-b border-border last:border-0 hover:bg-surface-2">
+              <Td>
+                <span className="flex items-center gap-1.5 font-mono text-[11px]">
+                  <span aria-hidden className="inline-block size-2" style={{ background: color(m.model) }} />
+                  {m.model}
+                </span>
+              </Td>
+              <Td num>{m.calls.toLocaleString("en")}</Td>
+              <Td num className={m.errors ? "text-critical" : ""}>{m.errors}</Td>
+              <Td num className={m.errors ? "text-critical" : ""}>{(m.error_rate * 100).toFixed(1)}%</Td>
+              <Td num>{formatDuration(m.avg_ms)}</Td>
+              <Td num>{formatDuration(m.p50_ms)}</Td>
+              <Td num className={m.p95_ms >= 2000 ? "text-warning" : ""}>{formatDuration(m.p95_ms)}</Td>
+              <Td num>{formatTokens(m.input_tokens)}</Td>
+              <Td num>{formatTokens(m.output_tokens)}</Td>
+              <Td num>{formatCost(m.cost_usd)}</Td>
+              <Td num>{formatCost(m.avg_cost_usd)}</Td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

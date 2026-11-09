@@ -2,9 +2,10 @@
 //
 // Rules (dataviz): fixed slot order, never cycled; colour follows the entity, not its rank.
 // So the slot comes from a STABLE list (all models seen in the last 90 days, sorted),
-// not from whatever happens to be in the current filter. Beyond 8 models: "Other".
+// not from whatever happens to be in the current filter.
 
-export const MAX_SERIES = 8;
+// Four slots (accent + three greys, per the design rules); more models fold into "Other".
+export const MAX_SERIES = 4;
 export const OTHER = "Other";
 
 export function modelColors(allModels: string[]): Map<string, string> {

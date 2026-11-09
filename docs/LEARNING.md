@@ -276,3 +276,35 @@ reclaims the messages and the row count doesn't change. We also killed the live 
 - A tree builder that drops spans with unknown parents: traces still in flight would look
   incomplete, and a lost parent would hide all of its children.
 - Calling the API from the browser with the key: anyone opening devtools could copy it.
+
+---
+
+## 9. Control room: "live" without WebSockets (`sdk/argus/spans.py`, `server/app/api/traces.py`, `dashboard/components/refresh.tsx`)
+
+**How it works**
+
+- **The problem:** the SDK sends a span when it *ends*. While a debate runs, the server only
+  has its finished children; the root span (with the topic) arrives last.
+- **Attributes:** `with argus.attributes(topic=..., round=2, role="pro"):` puts those values in
+  a `ContextVar`, like the current span. Every span *created* inside copies them into its
+  metadata, also the LLM calls from `wrap_openai`. So every finished child already says which
+  debate, round and speaker it belongs to.
+- **"In progress"** = a trace with no root span and a span received in the last 60 seconds.
+  `GET /v1/traces/live` merges all span metadata of such a trace (newest span wins), so the
+  dashboard can show topic, round and current speaker.
+- **Polling:** a small client component calls `router.refresh()` every few seconds. Next.js
+  re-runs the page's server components, which call the API with the key from the server's
+  environment, and swaps in the new HTML. The selected span and open tab survive. When the
+  browser tab is hidden, polling stops.
+- **System page:** the API and the worker each add to a per-minute counter in Redis
+  (`stats:ingested:<minute>`, `stats:written:<minute>`), so "spans in vs rows written per minute"
+  costs one `MGET`, not a scan of the spans table.
+
+**What would break without it**
+
+- Without attributes: a running debate would be a pile of anonymous LLM calls until the very
+  end; the Live page couldn't show the topic or who is speaking.
+- Without the 60 s window: a debate whose process crashed (no root ever) would look "running"
+  forever.
+- Polling from the browser straight to the API: the API key would have to be in the browser.
+- Not pausing when hidden: 50 open tabs would poll the server all day for nobody.

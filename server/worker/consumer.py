@@ -31,7 +31,7 @@ from pydantic import ValidationError
 from app.config import get_settings
 from app.schemas import SpanIn
 from app.storage import store_spans
-from app.streams import DEAD_LETTER_STREAM, GROUP, STREAM
+from app.streams import DEAD_LETTER_STREAM, GROUP, RATE_TTL_S, STREAM, rate_key
 
 logger = logging.getLogger("argus.worker")
 
@@ -146,7 +146,13 @@ class Worker:
 
         ids = [m.id for m in good] + skip_ids
         if ids:
-            self.r.xack(STREAM, GROUP, *ids)  # only now may Redis forget them
+            pipe = self.r.pipeline(transaction=False)
+            pipe.xack(STREAM, GROUP, *ids)  # only now may Redis forget them
+            if inserted:  # throughput counter for the System page (new rows only)
+                counter = rate_key("written")
+                pipe.incrby(counter, inserted)
+                pipe.expire(counter, RATE_TTL_S)
+            pipe.execute()
         logger.info("stored batch: %d message(s), %d new span(s)", len(ids), inserted)
         return len(ids)
 

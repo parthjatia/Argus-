@@ -95,6 +95,7 @@ services:
       ARENA_BAD_JSON_RATE: ${ARENA_BAD_JSON_RATE:-0}
       ARENA_SLOW_RATE: ${ARENA_SLOW_RATE:-0}
       ARENA_SLOW_SECONDS: ${ARENA_SLOW_SECONDS:-2}
+      FAKE_LATENCY_MS: ${FAKE_LATENCY_MS:-40}  # fake provider: base latency per LLM call
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}

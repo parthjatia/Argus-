@@ -193,3 +193,22 @@ def test_traffic_runs_many_debates_as_separate_traces(
     assert len(roots) == 4
     assert len({r["trace_id"] for r in roots}) == 4
     assert all(r["parent_span_id"] is None for r in roots)  # threads don't share context
+
+
+def test_every_span_carries_debate_attributes(spans: Collector) -> None:
+    run_debate("Cats vs dogs", "fake-small", "fake-large", "fake-large", rounds=2,
+               faults=Faults(), client=make_client(Faults(), fake_latency_s=0))  # fmt: skip
+    for e in spans.events:
+        m = e["metadata"]
+        assert m["topic"] == "Cats vs dogs" and m["rounds"] == 2, e["name"]
+        assert (m["pro_model"], m["con_model"]) == ("fake-small", "fake-large")
+    for e in spans.events:
+        if e["name"] in ("debate.turn", "lookup_fact"):
+            assert e["metadata"]["role"] in ("pro", "con") and e["metadata"]["round"] in (1, 2)
+        if e["name"] in ("judge", "judge.attempt"):
+            assert e["metadata"]["role"] == "judge"
+    gens = [e for e in spans.events if e["kind"] == "generation"]
+    assert {g["metadata"]["role"] for g in gens} == {"pro", "con", "judge"}
+    root = next(e for e in spans.events if e["parent_span_id"] is None)
+    assert root["metadata"]["winner"] in ("pro", "con", "tie")
+    assert isinstance(root["metadata"]["score_pro"], int)

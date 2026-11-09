@@ -11,9 +11,38 @@ judge JSON, so every failure path of the tracer is exercised.
 
 A one-person portfolio project, built in about a week.
 
-| Traces | Trace timeline + span detail | Metrics |
-|---|---|---|
-| ![Trace list](docs/screenshots/traces.png) | ![Waterfall](docs/screenshots/trace-detail.png) | ![Metrics](docs/screenshots/metrics.png) |
+![Overview](docs/screenshots/overview-dark.png)
+
+## Dashboard
+
+A dense "control room": a fixed sidebar (keys 1-6) and a top bar with the time range
+(15m / 1h / 24h / 7d), auto-refresh with an interval, "last updated" and the theme (light / dark /
+system). Square corners, 1px borders, greys plus one accent; red only for errors, amber only for
+slow (≥ 2 s) calls and warnings; monospace for IDs, numbers and JSON. Pages poll the read API
+(`router.refresh()`, paused while the tab is hidden); every panel has loading, empty and error
+states, and every ID can be copied.
+
+| Page | What it shows |
+|---|---|
+| **Overview** `/` | Traces in range, debates running, spans/min, error rate, cost, p95; live feed of the newest spans; running debates; cost and error bars |
+| **Live** `/live` | Debates in progress (topic, models per role, round x/y, current speaker, elapsed, spans, tokens, cost, latest step), refreshed every 2 s; recently finished with winner |
+| **Debates** `/debates/[id]` | Pro and Con side by side per round, fact lookups, LLM retries, judge attempts with the invalid JSON, verdict and scores, every error linked to its span |
+| **Traces** `/traces/[id]` | Filters and cursor paging; waterfall + inspector (Overview / Input / Output / Metadata / Error / Raw JSON), ↑/↓ between spans, Esc closes, `?span=` deep links |
+| **Metrics** `/metrics` | Cost per bucket and model, cost per debate role, p50/p95 per model, tokens per model, error-rate step line, model comparison table |
+| **System** `/system` | Postgres/Redis status, stream backlog, pending (unacked) messages, dead letters, workers, ingested vs written per minute |
+
+"In progress" means a trace with no root span yet and a span received in the last 60 s: the SDK
+sends spans when they end, so the root arrives last. The arena tags every span with
+`argus.attributes(topic=..., round=..., role=...)`, so a running debate's topic and speaker are
+known before it finishes.
+
+| Live (light) | Debate |
+|---|---|
+| ![Live](docs/screenshots/live-light.png) | ![Debate](docs/screenshots/debate-light.png) |
+| **Trace + inspector (dark)** | **Metrics** |
+| ![Trace](docs/screenshots/trace-dark.png) | ![Metrics](docs/screenshots/metrics-light.png) |
+| **System** | **Overview (light)** |
+| ![System](docs/screenshots/system-light.png) | ![Overview light](docs/screenshots/overview-light.png) |
 
 ---
 
@@ -177,14 +206,14 @@ These are the important ones:
 
 ## Testing
 
-- **SDK (36 tests):** nesting across sync, async and concurrent tasks; errors are recorded
+- **SDK (41 tests):** nesting across sync, async and concurrent tasks; errors are recorded
   and re-raised; the exporter never blocks while the server is down; overflow drops the oldest
-  spans; retry rules; truncation; `wrap_openai`.
-- **Server (55 tests, real Postgres + Redis):** 401 / 422 / 413; the same batch twice is stored
+  spans; retry rules; truncation; `wrap_openai`; `attributes()` propagation.
+- **Server (66 tests, real Postgres + Redis):** 401 / 422 / 413; the same batch twice is stored
   once; a child arriving before its parent; a worker killed between `COMMIT` and `XACK` (a real
   subprocess) is reclaimed with no duplicates; poison messages; cost; read API filters,
-  pagination and metrics.
-- **Demo (16 tests)** and **dashboard (10 tests,** tree building and formatting).
+  pagination, metrics, live traces, range metrics and `/v1/system` (including Redis down).
+- **Demo (17 tests)** and **dashboard (18 tests,** tree building, formatting, time ranges, debate view and current speaker).
 - **System level:** `make chaos` and `make load` above.
 
 ---

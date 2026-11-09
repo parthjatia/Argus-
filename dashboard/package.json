@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start -H 0.0.0.0 -p 3000",
-    "test": "node --experimental-strip-types --no-warnings --test lib/tree.test.ts lib/format.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test lib/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

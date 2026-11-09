@@ -62,8 +62,8 @@ argus/
 │   ├── argus/
 │   │   ├── __init__.py       # init(), observe, span, wrap_openai, flush, get_stats
 │   │   ├── client.py         # global state: init(), active exporter, atexit flush
-│   │   ├── context.py        # contextvars: current span
-│   │   ├── spans.py          # Span object + span() context manager (sync + async)
+│   │   ├── context.py        # contextvars: current span + inherited attributes
+│   │   ├── spans.py          # Span, span() (sync + async), attributes() → metadata of spans inside
 │   │   ├── decorators.py     # @observe for sync + async functions
 │   │   ├── exporter.py       # bounded queue + background batch sender
 │   │   ├── serialize.py      # JSON-safe conversion + truncation
@@ -76,21 +76,27 @@ argus/
 │   │   ├── main.py           # FastAPI app
 │   │   ├── auth.py           # API key → project_id
 │   │   ├── api/ingest.py     # POST /v1/ingest
-│   │   ├── api/traces.py     # trace list + detail
-│   │   ├── api/metrics.py    # cost, latency, error rate
+│   │   ├── api/traces.py     # trace list, live (in-progress) traces, detail
+│   │   ├── api/metrics.py    # cost, latency, errors + range metrics (summary, series, models, breakdown)
+│   │   ├── api/spans.py      # newest spans (live feed)
+│   │   ├── api/system.py     # pipeline health: Postgres, Redis, backlog, pending, rates
 │   │   ├── pricing.py        # cost from tokens using model_prices
 │   │   ├── schemas.py
 │   │   └── db.py
-│   ├── app/streams.py        # stream / group names shared by API and worker
+│   ├── app/streams.py        # stream / group names + per-minute rate counters (API and worker)
 │   ├── app/storage.py        # idempotent batch INSERT + cost from model_prices
 │   ├── worker/consumer.py    # Redis Stream → Postgres batch writer
 │   ├── migrations/           # plain SQL files, applied in order (0002 = example prices)
 │   └── tests/
-├── dashboard/                # Next.js 15 (App Router) + Tailwind 4 + Recharts 3
-│   ├── app/traces/           # list (filters, cursor paging) + [id] waterfall page
-│   ├── app/metrics/          # cost / latency / error-rate page
-│   ├── components/           # TraceView (waterfall + span detail), charts, badges
-│   └── lib/                  # api.ts (server-side client), tree.ts, format.ts (+ tests)
+├── dashboard/                # Next.js 15 (App Router) + Tailwind 4 + Recharts 3: "control room"
+│   ├── app/page.tsx          # Overview: tiles, live feed, running debates, cost/error bars
+│   ├── app/live/             # debates in progress (2 s refresh) + recently finished
+│   ├── app/debates/          # list + [id]: Pro/Con per round, facts, judge, errors/retries
+│   ├── app/traces/           # list (filters, cursor paging) + [id] waterfall + inspector
+│   ├── app/metrics/          # cost/model, cost/role, latency, tokens, error rate, comparison
+│   ├── app/system/           # Postgres/Redis health, backlog, pending, ingest vs write rate
+│   ├── components/           # shell (sidebar, top bar), refresh (polling), TraceView, charts
+│   └── lib/                  # api.ts (server-side), range, debate, tree, format (+ tests)
 ├── demo/                     # Docker image built from the repo root (needs ../sdk)
 │   ├── arena/
 │   │   ├── debate.py         # one debate = one trace (python -m arena.debate)
@@ -216,6 +222,14 @@ actually inserted (`RETURNING`), so duplicate events never double-count cost.
 | GET | `/v1/metrics/cost` | Cost per day, per model |
 | GET | `/v1/metrics/latency` | p50 / p95 duration per model |
 | GET | `/v1/metrics/errors` | Error rate over time |
+| GET | `/v1/traces/live` | Traces in progress: no root span yet + a span received in the last 60 s; merged span metadata (`attributes`) and the latest span |
+| GET | `/v1/spans/recent` | Newest finished spans, without input/output (live feed) |
+| GET | `/v1/metrics/summary` | Totals for `start`/`end`: traces, errors, cost, tokens, p50/p95, spans in the last 5 min, running traces |
+| GET | `/v1/metrics/timeseries` | Per `bucket_s` bucket (epoch-aligned, gaps filled): traces, error rate, spans, cost |
+| GET | `/v1/metrics/cost_by_model` | Per bucket and model: cost, calls, tokens |
+| GET | `/v1/metrics/models` | Per model: calls, errors, avg/p50/p95 latency, tokens, total and avg cost |
+| GET | `/v1/metrics/breakdown` | Generation cost grouped by a metadata attribute (`?attribute=role`) |
+| GET | `/v1/system` | Postgres/Redis status, stream length, backlog, pending, dead letters, consumers, ingested vs written per minute |
 | GET | `/health` | Liveness, plus DB and Redis connectivity |
 
 ---
@@ -258,12 +272,25 @@ actually inserted (`RETURNING`), so duplicate events never double-count cost.
 - Failure injection via env vars: `ARENA_TIMEOUT_RATE`, `ARENA_BAD_JSON_RATE`, `ARENA_SLOW_RATE`.
 - `traffic.py` runs N debates in parallel to fill the dashboard.
 
-## Dashboard
+## Dashboard ("control room")
 
-- `/traces`: table with name, start time, duration, cost, status, models. Filters.
-- `/traces/[id]`: waterfall timeline of nested spans. Clicking a span shows input, output,
-  tokens, cost and error.
-- `/metrics`: cost per day, p50/p95 latency per model, error rate.
+Design rules: radius 0 everywhere, 1px borders, no shadows / gradients / animation, neutral
+greys + one accent, red only for errors, amber only for slow (≥ 2 s LLM/tool call) or warnings,
+sans for text + monospace for IDs/numbers/JSON, numbers right-aligned. Bars and step lines only.
+Fixed left sidebar (keys 1-6); top bar with range (15m/1h/24h/7d, `?range=`), auto-refresh
+toggle + interval, last updated, theme (system/light/dark).
+
+- `/`: tiles (traces in range, running now, spans/min, error rate, cost, p95), live feed of the
+  newest spans, running debates, cost and error bars over time.
+- `/live`: debates in progress (topic, models per role, round, speaker, elapsed, spans, tokens,
+  cost, latest step), recently finished with winner. Refreshes every 2 s.
+- `/debates`, `/debates/[id]`: Pro and Con side by side per round, fact lookups, LLM retries,
+  judge attempts + verdict, every error; link to the trace.
+- `/traces`, `/traces/[id]`: filters + waterfall; inspector with tabs Overview / Input / Output /
+  Metadata / Error / Raw JSON (copy); ↑/↓ move between spans, Esc closes; `?span=` deep link.
+- `/metrics`: cost per bucket and model, cost per debate role, p50/p95 per model, tokens per
+  model, error-rate step line, model comparison table.
+- `/system`: Postgres/Redis status, backlog, pending, dead letters, workers, ingest vs write rate.
 
 ---
 
@@ -275,7 +302,7 @@ docker compose up -d --build      # postgres, redis, server, worker, dashboard
 make migrate                      # apply SQL migrations
 make seed                         # create a demo project + print its API key
 make demo TOPIC="..."             # one debate (LLM_PROVIDER from .env, default fake)
-make traffic N=50                 # run many debates
+make traffic N=50                 # run many debates (FAKE_LATENCY_MS=1500 for long, "live" debates)
 make test                         # pytest for sdk + server
 make lint                         # ruff
 make load                         # k6 load test of the ingestion API (VUS=20 DURATION=30s)
@@ -371,13 +398,22 @@ make chaos                        # kill/restart worker + API during traffic, ch
 | Trace summaries are aggregated from `spans` on every list request | Simplest correct design (see schema notes); no summary table to keep consistent | Cost grows with a project's span count; add a `traces` table only if it gets slow |
 | Error rate per bucket uses `generate_series` to fill empty buckets; empty = `null`, not 0% | No misleading gaps or fake zeros | Hourly over 30 days = 720 points (the UI switches to daily buckets above 7 days) |
 | Dashboard: filters are a plain GET form (state in the URL) | Shareable links, back button works, no client state | Full page reload on Apply |
-| Chart colours: reference palette slots, assigned by the sorted list of models seen in the last 90 days; > 8 models fold into "Other" | A model keeps its colour when the time range changes (colour follows the entity) | One extra metrics query |
+| Chart colours: accent + three greys (design rule: greys + one accent), assigned by the sorted list of models seen in the last 90 days; > 4 models fold into "Other" | A model keeps its colour when the time range changes (colour follows the entity) | One extra metrics query; only 4 distinct model colours |
 | Latency per model drawn as HTML bars (p50 solid, to p95 lighter) instead of a chart | Two percentiles per model with model colours, no clash with the cost chart's colours |  |
 | Dashboard unit tests use `node --test` with type stripping (no Jest/Vitest) | No extra dependency; runs in plain `node:22-alpine` | Tested modules must use erasable TypeScript only |
 | Next.js `output: "standalone"` image; `npm test` + `next build` (type-check) gate the image build | Small runtime image; a broken tree builder or type error fails `up` | Dashboard code changes need an image rebuild |
 | Load test = k6 in Docker on the compose network (`grafana/k6:0.54.0`), driven by `loadtest/run_load.py`; each run uses a fresh project | No host install; per-run project makes stored-row counts exact; measures both ingest (client view) and worker drain rate | k6 shares the machine's CPUs with the system under test |
 | Chaos and load drivers are stdlib-only Python on the host | They must run `docker compose kill/start`; no extra dependencies | Need Python 3.12 on the host |
 | API process count via `WEB_CONCURRENCY` (read by uvicorn), default 1 | Scale ingest without code changes (measured 9.1k → 21.9k spans/s with 4) | Each process has its own DB pool (max 10 connections) |
+| "In progress" = a trace with **no root span** and a span **received in the last 60 s** (`received_at`), looked at over the last 6 h | The SDK sends a span when it ends, so a running trace never has its root yet; the 60 s window drops crashed apps' traces instead of showing them as running forever | A trace whose children are all longer than 60 s looks idle; a debate that crashed shows "running" for up to 60 s |
+| SDK `argus.attributes(**kv)`: a `ContextVar` of key/values copied into the metadata of every span created inside (also `wrap_openai` generations) | Running debates need topic, round and role on child spans before the root (which has the topic) arrives; same propagation rules as the current span | Values are repeated on every span (a few bytes each) |
+| Live attributes = all span metadata of a trace merged with `jsonb_object_agg` ordered by `end_time` (newest wins) | Generic (works for any app's metadata), one query; current round/role come from the newest span | Arena-specific meaning (speaker, round) lives in `dashboard/lib/debate.ts` |
+| Polling = `router.refresh()` every N s from a client provider, paused while `document.hidden`; Live forces 2 s | No WebSockets, no client-side API key: server components re-fetch, client state (selected span, tabs) survives | Each refresh re-renders the whole page on the server |
+| Panels are async server components in their own `<Suspense>` with loading / empty / error states | One slow or failing endpoint never blanks the page | More requests per page view |
+| Range metrics take absolute `start`/`end` + `bucket_s`; buckets via `date_bin(..., 'epoch')`, ≤ 1,500 per request | Any range (15 m … 7 d) with one API; epoch alignment keeps bars still while refreshing | Clients compute the window; old `?days=` endpoints kept for compatibility |
+| `/v1/system` describes the shared pipeline (not one project); throughput = per-minute Redis counters (`stats:ingested:<min>`, `stats:written:<min>`, 2 h TTL) incremented by the API and the worker | Rates without scanning Postgres; `written` counts only new rows, so ingested − written shows duplicates/backlog | Any valid key sees pipeline-level numbers (fine for single-tenant self-hosting) |
+| Fonts: IBM Plex Sans + Plex Mono via `next/font` (self-hosted at build time) | One sans + one mono, identical in every browser and in screenshots; no requests to Google at runtime | `next build` needs network access to fetch the fonts |
+| Theme: `prefers-color-scheme` by default; top-bar choice in `localStorage`, applied by an inline script before paint (`?theme=` for screenshots) | No flash of the wrong theme; dark tokens are chosen, not inverted | Dark tokens are duplicated in CSS (media query + `[data-theme=dark]`) |
 | `/health` returns `503` when Postgres or Redis is unreachable | Load balancers and `docker compose` healthchecks react to the status code, not the body | The body says which dependency failed, but details stay in server logs |
 | Dev server image includes pytest + ruff; repo mounted at `/repo` | `make test` / `make lint` only need Docker on the host, same environment for everyone | Image is larger than a production image; a slim prod image is a later step |
 | Send spans when they end, not start + end events | Simpler protocol, one row per span | Long-running spans are invisible until they finish |

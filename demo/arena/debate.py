@@ -2,6 +2,10 @@
 
     python -m arena.debate --topic "Remote work is better than office work" [--rounds 3]
 
+Every span carries metadata `topic`, `rounds`, `pro_model`, `con_model`, `judge_model`;
+spans inside a round add `round`, a turn's spans add `role` (pro | con), the judge's `role`
+= judge. The root adds `winner`, `score_pro`, `score_con` and `failed_turns` when it ends.
+
 Trace shape:
     debate
     ├── debate.round (×rounds)
@@ -60,22 +64,31 @@ def run_debate(
     judge = Judge(judge_model, client)
     models = {"pro": pro_model, "con": con_model, "judge": judge_model}
 
-    with argus.span("debate", input={"topic": topic, "rounds": rounds, "models": models},
-                    metadata={"provider": provider()}) as root:  # fmt: skip
+    # Attributes go into the metadata of every span created inside (also LLM calls), so
+    # the dashboard can show topic, round and speaker while the root span is still open.
+    with (
+        argus.attributes(topic=topic, rounds=rounds, pro_model=pro_model,
+                         con_model=con_model, judge_model=judge_model),
+        argus.span("debate", input={"topic": topic, "rounds": rounds, "models": models},
+                   metadata={"provider": provider()}) as root,
+    ):  # fmt: skip
         transcript: list[Turn] = []
         failed = 0
         for n in range(1, rounds + 1):
-            with argus.span("debate.round", metadata={"round": n}):
+            with argus.attributes(round=n), argus.span("debate.round", metadata={"round": n}):
                 for debater in debaters:
                     try:
-                        text: str | None = debater.take_turn(topic, n, transcript)
+                        with argus.attributes(role=debater.side):
+                            text: str | None = debater.take_turn(topic, n, transcript)
                     except LLMTimeout:
                         text, failed = None, failed + 1  # the turn span shows the error
                     transcript.append(Turn(n, debater.side, text))
 
-        verdict = judge.decide(topic, transcript)
+        with argus.attributes(role="judge"):
+            verdict = judge.decide(topic, transcript)
         root.set_output(verdict.model_dump())
-        root.set_metadata(failed_turns=failed, winner=verdict.winner)
+        root.set_metadata(failed_turns=failed, winner=verdict.winner,
+                          score_pro=verdict.scores.pro, score_con=verdict.scores.con)  # fmt: skip
         return DebateResult(topic, root.trace_id, transcript, verdict, failed)
 
 
