@@ -1,5 +1,5 @@
 # All targets run inside Docker, so the only host requirements are Docker and make.
-.PHONY: up down logs build test lint format
+.PHONY: up down logs build migrate seed test lint format
 
 up:
 	docker compose up -d --build
@@ -12,6 +12,15 @@ logs:
 
 build:
 	docker compose build
+
+# Applies pending files from server/migrations/ (safe to run repeatedly).
+migrate:
+	docker compose run --rm server python -m app.migrate
+
+# Creates/reuses the "demo" project and prints a new API key. Override: make seed NAME=myproj
+NAME ?= demo
+seed:
+	docker compose run --rm server python -m app.seed $(NAME)
 
 # Starts postgres + redis (via depends_on) and runs pytest in a throwaway server container.
 test:
