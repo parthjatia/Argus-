@@ -16,16 +16,19 @@ well-explained code over clever or "enterprise" code.
 
 I'm building this to learn and to explain it in interviews. Follow these rules:
 
-1. **Core components: explain before coding.** For the SDK context/nesting, the SDK exporter,
-   ingestion idempotency and the Redis Stream worker, first describe the design in a few bullets
-   and wait for my OK. Then implement in small steps.
-2. **After each core piece**, explain how it works and what would break if a key line were removed.
-3. **Boilerplate and UI can be generated freely**: Docker, configs, dashboard pages, charts, demo app.
-4. **Small changes, one concern at a time.** Run the relevant tests after every change.
-5. **Ask before adding a new dependency.** Prefer the standard library where reasonable.
+1. **Speed over explanations. Don't wait for an OK before coding**, including core components.
+   Make sensible decisions yourself, follow this file, and record non-obvious choices in
+   "Design decisions".
+2. **Dependencies:** well-known packages that fit the Stack below may be added without asking;
+   list them in the summary. Prefer the standard library where reasonable.
+3. **Only stop and ask** if truly blocked or a decision is hard to undo.
+4. **After each milestone:** run all tests and ruff, fix failures, commit, and give a summary of
+   at most 5 lines.
+5. **Keep `docs/LEARNING.md`:** for every core component (SDK context/nesting, SDK exporter,
+   API key auth, ingestion + idempotency, Redis Stream worker), add a short beginner-friendly
+   explanation of how it works and what would break without it.
 6. **Never put secrets in code.** Use `.env` (git-ignored) and keep `.env.example` up to date.
-7. **Update the "Design decisions" section** below whenever we make a non-obvious choice.
-8. If something in this file is wrong or outdated, tell me and propose an edit.
+7. If something in this file is wrong or outdated, say so and fix it.
 
 ---
 
@@ -34,7 +37,7 @@ I'm building this to learn and to explain it in interviews. Follow these rules:
 | Area | Choice |
 |---|---|
 | SDK | Python 3.12, standard library (`contextvars`, `threading`, `queue`), `httpx` |
-| Server | FastAPI, Pydantic v2, `psycopg` (v3, async), Uvicorn |
+| Server | FastAPI, Pydantic v2, `psycopg` (v3, async) + `psycopg_pool`, Uvicorn |
 | Buffer | Redis Streams (consumer group) |
 | Database | PostgreSQL (JSONB for prompts/outputs) |
 | Dashboard | Next.js (App Router) + TypeScript, Tailwind, Recharts |
@@ -274,9 +277,9 @@ make load                         # load test the ingestion API
 - [ ] SDK: exceptions mark the span as error and are re-raised
 - [ ] SDK: exporter never blocks the caller when the server is down
 - [ ] SDK: queue overflow drops oldest events and counts them
-- [ ] Server: invalid API key → 401; invalid batch → 422
-- [ ] Server: the same batch sent twice → each span stored once
-- [ ] Server: a child span arriving before its parent is stored and shown correctly
+- [x] Server: invalid API key → 401; invalid batch → 422
+- [x] Server: the same batch sent twice → each span stored once
+- [x] Server: a child span arriving before its parent is stored (shown correctly: dashboard, Milestone 4)
 - [ ] Worker: killed mid-batch → messages are reclaimed and stored, no duplicates
 - [ ] End-to-end: `make demo` produces a complete trace visible in the dashboard
 - [ ] Load test: record events/second and p95 ingest latency in the README
@@ -318,6 +321,12 @@ make load                         # load test the ingestion API
 | API keys stored as SHA-256 hashes (`argus_` + 32 random bytes) | A database leak doesn't leak usable keys; keys are long and random, so a fast hash is safe and allows an indexed lookup | A lost key can't be recovered, only replaced |
 | Migrations: plain SQL files + a `schema_migrations` table, each file in one transaction, guarded by an advisory lock | Each file is applied exactly once and fully or not at all; no migration framework dependency | No down-migrations; fix forward with a new file |
 | Tests use a separate `<db>_test` database, recreated per test | Tests never touch dev data and always start from a clean, freshly migrated schema | ~100 ms per DB test; switch to per-session DB + truncation if the suite grows |
+| Ingest checks run in order: size (413) → API key (401) → validation (422) → insert (202) | Cheap checks first; unauthenticated callers learn nothing about the format. The body is parsed by hand (`model_validate_json`) because FastAPI parses declared bodies *before* dependencies | Slightly more code than a typed body parameter |
+| `202 {"accepted": n}`, no "inserted" count | Once ingest goes through Redis (Milestone 3), the server can't know at request time how many spans are new; the contract stays the same | Clients can't see duplicates; the server logs the inserted count |
+| One invalid span rejects the whole batch (`422`) | Simple, clear errors; invalid spans mean an SDK bug | The SDK doesn't retry 4xx, so the valid spans in that batch are lost |
+| Unknown span fields are ignored (`extra="ignore"`) | A newer SDK can send new fields to an older server without losing data | Typos in field names aren't caught |
+| Limits: 1,000 spans/batch, 5 MB body, 200-char names, `model` required for `generation` | Bound memory and row size per request | Real payloads above 5 MB are rejected (the SDK truncates at 32 KB per field) |
+| Postgres errors → `503`; the pool opens without waiting | 5xx tells the SDK to retry; the server starts and `/health` reports the problem while Postgres is down | Requests wait up to `DB_POOL_TIMEOUT_S` (3 s) before the 503 |
 | `/health` returns `503` when Postgres or Redis is unreachable | Load balancers and `docker compose` healthchecks react to the status code, not the body | The body says which dependency failed, but details stay in server logs |
 | Dev server image includes pytest + ruff; repo mounted at `/repo` | `make test` / `make lint` only need Docker on the host, same environment for everyone | Image is larger than a production image; a slim prod image is a later step |
 | Send spans when they end, not start + end events | Simpler protocol, one row per span | Long-running spans are invisible until they finish |

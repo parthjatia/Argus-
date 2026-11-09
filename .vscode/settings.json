@@ -1,3 +1,7 @@
 {
-    "python.terminal.useEnvFile": true
+    "python.terminal.useEnvFile": true,
+    // Local venv (create with: py -3.12 -m venv .venv; .venv\Scripts\pip install -r server/requirements-dev.txt)
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+    // So `from app.x import y` in server/ resolves like it does inside the container.
+    "python.analysis.extraPaths": ["server"]
 }

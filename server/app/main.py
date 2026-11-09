@@ -2,21 +2,48 @@
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import psycopg
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from app.api.ingest import router as ingest_router
 from app.config import get_settings
+from app.db import create_pool
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("argus.server")
 
 CHECK_TIMEOUT_S = 2.0
 
-app = FastAPI(title="Argus", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    pool = create_pool(get_settings())
+    await pool.open(wait=False)  # don't block startup if Postgres is down
+    app.state.pool = pool
+    try:
+        yield
+    finally:
+        await pool.close()
+
+
+app = FastAPI(title="Argus", version="0.1.0", lifespan=lifespan)
+app.include_router(ingest_router)
+
+
+@app.exception_handler(psycopg.OperationalError)
+async def database_unavailable(request: Request, exc: psycopg.OperationalError) -> JSONResponse:
+    # Covers "can't connect" and psycopg_pool.PoolTimeout (a subclass). 503, not 500,
+    # tells the SDK this is temporary and worth retrying with backoff.
+    logger.error("database unavailable on %s: %r", request.url.path, exc)
+    return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+
 
 CheckStatus = Literal["ok", "error"]
 

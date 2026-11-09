@@ -4,6 +4,7 @@ Run with:  python -m app.migrate   (or `make migrate`)
 """
 
 from pathlib import Path
+from typing import LiteralString, cast
 
 import psycopg
 
@@ -41,7 +42,9 @@ def apply_migrations(conninfo: str, migrations_dir: Path = MIGRATIONS_DIR) -> li
                 # The file and its bookkeeping row commit together, or neither does.
                 # A failing file leaves no half-created tables and is retried next run.
                 with conn.transaction():
-                    conn.execute(path.read_text(encoding="utf-8"))
+                    # psycopg's types only accept literal SQL strings (to prevent injection).
+                    # Migration files are trusted code from this repo, so the cast is safe.
+                    conn.execute(cast(LiteralString, path.read_text(encoding="utf-8")))
                     conn.execute(
                         "INSERT INTO schema_migrations (filename) VALUES (%s)", (path.name,)
                     )
