@@ -2,6 +2,7 @@
 //
 // Each iteration sends one SDK-shaped batch (BATCH spans, default 100 = the SDK's batch
 // size) and checks for 202. VUS virtual users send back-to-back for DURATION.
+// Spans are synthetic (no LLM is called), so this runs without Ollama or Groq.
 //   events/second = spans accepted / test duration
 //   latency       = http_req_duration (p50 / p95 / p99), time to 202 (after XADD)
 //
@@ -56,7 +57,7 @@ function makeBatch() {
       start_time: start.toISOString(),
       end_time: new Date(start.getTime() + 8).toISOString(),
       status: "ok",
-      model: gen ? "fake-small" : null,
+      model: gen ? "synthetic-llm" : null,
       input: gen ? { messages: [{ role: "user", content: "a".repeat(250) }] } : {},
       output: gen ? { text: "b".repeat(250) } : {},
       input_tokens: gen ? 120 : null,

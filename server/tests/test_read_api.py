@@ -54,7 +54,7 @@ def make_trace(
     start: float = 0,
     *,
     status: str = "ok",
-    model: str = "fake-small",
+    model: str = "test-small",
     child_error: bool = False,
     tokens: int = 1000,
 ) -> tuple[UUID, list[SpanIn]]:
@@ -97,7 +97,7 @@ def test_list_summarises_each_trace(reader: Reader) -> None:
     assert t["status"] == "ok"  # root succeeded even though a child failed
     assert t["error_count"] == 1
     assert t["span_count"] == 2
-    assert t["models"] == ["fake-small"]
+    assert t["models"] == ["test-small"]
     assert t["total_cost_usd"] == pytest.approx((1000 * 0.10 + 1000 * 0.40) / 1e6)
     assert t["has_root"] is True
 
@@ -112,8 +112,8 @@ def test_trace_without_root_yet_is_listed(reader: Reader) -> None:
 
 
 def test_filters(reader: Reader) -> None:
-    ok_trace, s1 = make_trace(0, model="fake-small", tokens=10)
-    err_trace, s2 = make_trace(-10, status="error", model="fake-large", tokens=100_000)
+    ok_trace, s1 = make_trace(0, model="test-small", tokens=10)
+    err_trace, s2 = make_trace(-10, status="error", model="test-large", tokens=100_000)
     reader.store(s1 + s2)
 
     def ids(**params: Any) -> list[str]:
@@ -121,7 +121,7 @@ def test_filters(reader: Reader) -> None:
 
     assert ids() == [str(ok_trace), str(err_trace)]  # newest first
     assert ids(status="error") == [str(err_trace)]
-    assert ids(model="fake-large") == [str(err_trace)]
+    assert ids(model="test-large") == [str(err_trace)]
     assert ids(min_cost=0.01) == [str(err_trace)]
     assert ids(min_duration_ms=2500) == []
     assert ids(start=(NOW - timedelta(seconds=5)).isoformat()) == [str(ok_trace)]
@@ -168,12 +168,12 @@ def test_detail_returns_all_spans_flat(reader: Reader) -> None:
 
 
 def test_cost_metrics_per_day_and_model(reader: Reader) -> None:
-    reader.store(make_trace(model="fake-small")[1] + make_trace(-1, model="fake-large")[1])
+    reader.store(make_trace(model="test-small")[1] + make_trace(-1, model="test-large")[1])
     rows = reader.get("/v1/metrics/cost").json()
     by_model = {r["model"]: r for r in rows}
-    assert set(by_model) == {"fake-small", "fake-large"}
-    assert by_model["fake-large"]["calls"] == 1
-    assert by_model["fake-large"]["cost_usd"] == pytest.approx((1000 * 0.8 + 1000 * 3.2) / 1e6)
+    assert set(by_model) == {"test-small", "test-large"}
+    assert by_model["test-large"]["calls"] == 1
+    assert by_model["test-large"]["cost_usd"] == pytest.approx((1000 * 0.8 + 1000 * 3.2) / 1e6)
 
 
 def test_latency_percentiles(reader: Reader) -> None:

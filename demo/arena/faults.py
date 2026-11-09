@@ -11,8 +11,20 @@ import random
 from dataclasses import dataclass, field
 
 
-class LLMTimeout(TimeoutError):
+class LLMError(Exception):
+    """An LLM call failed after its retries: a debater's turn fails, a judge's fails the debate."""
+
+
+class LLMTimeout(LLMError, TimeoutError):
     """An LLM request timed out (real or injected)."""
+
+
+class LLMRateLimited(LLMError):
+    """The provider kept answering 429 Too Many Requests."""
+
+
+class LLMUnavailable(LLMError):
+    """Connection refused/reset or a 5xx from the provider (e.g. Ollama not running)."""
 
 
 class ToolTimeout(TimeoutError):

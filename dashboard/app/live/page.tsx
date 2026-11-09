@@ -52,8 +52,8 @@ async function InProgress({ range }: { range: RangeKey }) {
     <Panel title="In progress" right={<span className="num">{live.length} running</span>}>
       {live.length === 0 ? (
         <Empty>
-          No debate is running. Start some with <code className="mx-1 font-mono">make traffic N=20</code> (use
-          <code className="mx-1 font-mono">FAKE_LATENCY_MS=1500</code> to slow them down).
+          No debate is running. Start one with <code className="mx-1 font-mono">make demo</code> or several
+          with <code className="mx-1 font-mono">make traffic N=4</code> (real models: a debate takes minutes).
         </Empty>
       ) : (
         <div className="overflow-x-auto">

@@ -16,35 +16,35 @@ function sp(id: string, name: string, parent: string | null, extra: Partial<Span
 
 const gen = (id: string, parent: string, text: string, extra: Partial<Span> = {}) =>
   sp(id, "openai.chat.completions", parent, {
-    kind: "generation", model: "fake-small", output: { role: "assistant", content: text },
+    kind: "generation", model: "llama3.2:3b", output: { role: "assistant", content: text },
     input_tokens: 10, output_tokens: 5, cost_usd: 0.001, ...extra,
   });
 
 function fullDebate(): Span[] {
   clock = 0;
-  const m = (x: object): Json => ({ topic: "Tea vs coffee", rounds: 1, pro_model: "fake-small",
-                                      con_model: "fake-large", judge_model: "fake-large", ...x });
+  const m = (x: object): Json => ({ topic: "Tea vs coffee", rounds: 1, pro_model: "llama3.2:3b",
+                                      con_model: "openai/gpt-oss-120b", judge_model: "openai/gpt-oss-120b", ...x });
   return [
     sp("root", "debate", null, { input: { topic: "Tea vs coffee", rounds: 1 },
       output: { winner: "con", scores: { pro: 6, con: 8 }, reasoning: "Better evidence." },
       metadata: m({ winner: "con" }) }),
     sp("r1", "debate.round", "root", { metadata: m({ round: 1 }) }),
-    sp("tp", "debate.turn", "r1", { input: { side: "pro", round: 1, model: "fake-small" },
+    sp("tp", "debate.turn", "r1", { input: { side: "pro", round: 1, model: "llama3.2:3b" },
       output: "Tea is calmer.", metadata: m({ round: 1, role: "pro" }) }),
     sp("fp", "lookup_fact", "tp", { kind: "tool", output: "a fact", metadata: m({ round: 1, role: "pro" }) }),
     gen("gp1", "tp", "", { status: "error", error_message: "LLMTimeout: injected", output: null,
       input_tokens: null, output_tokens: null, cost_usd: null, metadata: m({ round: 1, role: "pro" }) }),
     gen("gp2", "tp", "Tea is calmer.", { metadata: m({ round: 1, role: "pro" }) }),
-    sp("tc", "debate.turn", "r1", { input: { side: "con", round: 1, model: "fake-large" },
+    sp("tc", "debate.turn", "r1", { input: { side: "con", round: 1, model: "openai/gpt-oss-120b" },
       output: "Coffee works.", metadata: m({ round: 1, role: "con" }) }),
     sp("fc", "lookup_fact", "tc", { kind: "tool", status: "error", error_message: "ToolTimeout" }),
-    gen("gc", "tc", "Coffee works.", { model: "fake-large", metadata: m({ round: 1, role: "con" }) }),
+    gen("gc", "tc", "Coffee works.", { model: "openai/gpt-oss-120b", metadata: m({ round: 1, role: "con" }) }),
     sp("judge", "judge", "root", { metadata: m({ role: "judge" }) }),
     sp("ja1", "judge.attempt", "judge", { status: "error", error_message: "InvalidVerdict: json",
       metadata: m({ role: "judge", attempt: 1 }) }),
-    gen("jg1", "ja1", "Sure! {", { model: "fake-large" }),
+    gen("jg1", "ja1", "Sure! {", { model: "openai/gpt-oss-120b" }),
     sp("ja2", "judge.attempt", "judge", { metadata: m({ role: "judge", attempt: 2 }) }),
-    gen("jg2", "ja2", '{"winner":"con"}', { model: "fake-large" }),
+    gen("jg2", "ja2", '{"winner":"con"}', { model: "openai/gpt-oss-120b" }),
   ];
 }
 
@@ -52,7 +52,7 @@ test("buildDebate: rounds, turns, facts, retries, verdict", () => {
   const d = buildDebate("t1", fullDebate());
   assert.equal(d.topic, "Tea vs coffee");
   assert.equal(d.status, "ok");
-  assert.deepEqual(d.models, { pro: "fake-small", con: "fake-large", judge: "fake-large" });
+  assert.deepEqual(d.models, { pro: "llama3.2:3b", con: "openai/gpt-oss-120b", judge: "openai/gpt-oss-120b" });
   assert.equal(d.rounds.length, 1);
   const { pro, con } = d.rounds[0];
   assert.equal(pro?.text, "Tea is calmer.");
@@ -93,7 +93,7 @@ test("currentSpeaker follows turn order", () => {
 test("liveDebate summarises a live trace", () => {
   const t: LiveTrace = {
     trace_id: "t", start_time: "2026-01-01T00:00:00Z", last_received_at: "2026-01-01T00:00:05Z",
-    span_count: 7, error_count: 0, models: ["fake-small"], total_cost_usd: 0.01, input_tokens: 1,
+    span_count: 7, error_count: 0, models: ["llama3.2:3b"], total_cost_usd: 0.01, input_tokens: 1,
     output_tokens: 1,
     attributes: { topic: "X", rounds: 3, round: 2, role: "pro", pro_model: "a", con_model: "b", judge_model: "c" },
     latest_span: { name: "debate.turn", kind: "span", status: "ok", model: null,

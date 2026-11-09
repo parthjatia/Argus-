@@ -6,9 +6,8 @@ export function formatDuration(ms: number | null | undefined): string {
   if (ms < 1) return "<1 ms";
   if (ms < 1000) return `${Math.round(ms)} ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.round((ms % 60_000) / 1000);
-  return `${m}m ${s}s`;
+  const total = Math.round(ms / 1000); // round first, so 119.6 s is "2m 0s", not "1m 60s"
+  return `${Math.floor(total / 60)}m ${total % 60}s`;
 }
 
 export function formatCost(usd: number | null | undefined): string {

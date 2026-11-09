@@ -27,9 +27,21 @@ def empty_db() -> Iterator[str]:
     yield make_conninfo(dev_url, dbname=test_name)
 
 
+# Test-only prices, so cost tests don't depend on the real (free) models in the migrations.
+# test-large has two versions to check that the price valid at start_time is used.
+TEST_PRICES = """
+INSERT INTO model_prices (model, input_per_1m_usd, output_per_1m_usd, valid_from) VALUES
+  ('test-small', 0.10, 0.40, '2024-01-01T00:00:00Z'),
+  ('test-large', 1.00, 4.00, '2024-01-01T00:00:00Z'),
+  ('test-large', 0.80, 3.20, '2026-06-01T00:00:00Z')
+"""
+
+
 @pytest.fixture
 def migrated_db(empty_db: str) -> str:
     apply_migrations(empty_db)
+    with psycopg.connect(empty_db) as conn:
+        conn.execute(TEST_PRICES)
     return empty_db
 
 

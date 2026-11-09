@@ -6,8 +6,10 @@ ingests them, and a Next.js dashboard shows each trace as a timeline, plus cost,
 error rates. Think of it as a small, focused [Langfuse](https://langfuse.com).
 
 The repo also contains the **AI Debate Arena**: two LLMs debate a topic and a third judges.
-It exists to produce realistic traces, including injected timeouts, slow calls and invalid
-judge JSON, so every failure path of the tracer is exercised.
+It runs on **real models only**: both debaters are `llama3.2:3b` on a local Ollama, the judge is
+`openai/gpt-oss-120b` on Groq's free tier. It exists to produce realistic traces, including
+real rate limits (429), slow CPU inference, plus injected timeouts and invalid judge JSON, so
+every failure path of the tracer is exercised.
 
 A one-person portfolio project, built in about a week.
 
@@ -78,18 +80,24 @@ Every piece is explained for beginners in [`docs/LEARNING.md`](docs/LEARNING.md)
 
 ## Quick start
 
-Needs only Docker (and `make`; on Windows without `make`, run the command behind each target
-from the [`Makefile`](Makefile)).
+Needs Docker (and `make`; on Windows without `make`, run the command behind each target
+from the [`Makefile`](Makefile)). For the Debate Arena you also need
+[Ollama](https://ollama.com) on the host (`ollama pull llama3.2:3b`) and a free
+[Groq API key](https://console.groq.com/keys).
 
 ```bash
-cp .env.example .env             # set POSTGRES_PASSWORD
+cp .env.example .env             # set POSTGRES_PASSWORD and GROQ_API_KEY
 docker compose up -d --build     # postgres, redis, server :8000, worker, dashboard :3000
-make migrate                     # apply SQL migrations (incl. example model prices)
+make migrate                     # apply SQL migrations (incl. model prices)
 make seed                        # prints an API key → put it in ARGUS_API_KEY in .env
 docker compose up -d             # recreate the dashboard with the key
-make demo TOPIC="Tabs are better than spaces"   # one debate = one trace
-make traffic N=50                # 50 debates in parallel, with injected failures
+make demo TOPIC="Tabs are better than spaces"   # one real debate = one trace (~2 min on CPU)
+make traffic N=4                 # 4 debates, 2 at a time (CONCURRENCY=2 by default)
 ```
+
+> Variables set in your shell override `.env` for `docker compose`. If spans are rejected
+> with `401 invalid API key`, check for a stale `ARGUS_API_KEY` in your terminal
+> (PowerShell: `Remove-Item Env:ARGUS_API_KEY`).
 
 Open <http://localhost:3000>.
 
@@ -118,8 +126,8 @@ def answer(question: str) -> str:
 |---|---|
 | `make test` | pytest for server, SDK and demo, plus the dashboard unit tests (all in Docker) |
 | `make lint` | ruff check + format check |
-| `make load` | k6 load test of `POST /v1/ingest` (see below) |
-| `make chaos` | traffic while killing the worker and API; verifies exactly-once storage |
+| `make load` | k6 load test of `POST /v1/ingest` with synthetic spans (see below) |
+| `make chaos` | synthetic traffic while killing the worker and API; verifies exactly-once storage |
 
 ---
 
@@ -129,6 +137,10 @@ All on one laptop: Windows 11, Docker Desktop (16 vCPUs, 7.6 GB), with k6, the A
 Postgres and the worker competing for the same CPUs. Batches of 100 spans (the SDK's batch
 size), a third of them LLM generations with ~500 bytes of prompt and output. Raw results are in
 [`loadtest/results/`](loadtest/results).
+
+The load and chaos tests send **synthetic spans** straight to the API and never call an LLM, so
+they run without Ollama or Groq. A real debate, for comparison: ~25 spans in 1.5–2 minutes
+(each `llama3.2:3b` turn takes 13–30 s on CPU; the Groq judge ~1–2 s).
 
 ### Ingest (`make load`, k6, 30 s per run)
 
@@ -213,7 +225,10 @@ These are the important ones:
   once; a child arriving before its parent; a worker killed between `COMMIT` and `XACK` (a real
   subprocess) is reclaimed with no duplicates; poison messages; cost; read API filters,
   pagination, metrics, live traces, range metrics and `/v1/system` (including Redis down).
-- **Demo (17 tests)** and **dashboard (18 tests,** tree building, formatting, time ranges, debate view and current speaker).
+- **Demo (27 tests):** trace shape, judge JSON retry, 429 with `Retry-After` / backoff (each
+  attempt its own span), timeouts, 5xx, no retry on 4xx, per-role config, the traffic
+  concurrency limit. They use a small stub LLM that lives in `demo/tests/` only.
+- **Dashboard (18 tests):** tree building, formatting, time ranges, debate view and current speaker.
 - **System level:** `make chaos` and `make load` above.
 
 ---
@@ -224,7 +239,7 @@ These are the important ones:
 sdk/        Python SDK (pip install -e sdk; import argus)
 server/     FastAPI app (ingest, read API, auth, pricing), worker/, SQL migrations, tests
 dashboard/  Next.js 15 + Tailwind + Recharts
-demo/       AI Debate Arena (fake | ollama | openai provider, failure injection)
+demo/       AI Debate Arena (Ollama debaters, Groq judge, 429 retries, failure injection)
 loadtest/   k6 ingest test, chaos test, results/
 docs/       LEARNING.md (how each component works), screenshots
 ```

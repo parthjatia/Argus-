@@ -1,5 +1,6 @@
 """Load test driver: creates a fresh project + key, runs k6 (ingest.js) in Docker against
-the API, then measures how fast the worker drains the stream into Postgres.
+the API, then measures how fast the worker drains the stream into Postgres. Spans are
+synthetic (ingest.js builds them); no LLM is called.
 
     python loadtest/run_load.py [--vus 20] [--duration 30s] [--batch 100]   # or: make load
 

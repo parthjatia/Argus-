@@ -1,133 +1,82 @@
-"""LLM provider switch: LLM_PROVIDER=fake | ollama | openai.
+"""Real LLM clients, one per debate role, all OpenAI-compatible and traced with wrap_openai.
 
-Every provider exposes the OpenAI client interface (`client.chat.completions.create`),
-so `argus.wrap_openai` traces all of them identically. Faults are injected in a layer
-*inside* the wrapper, so injected timeouts and slowness show up in the generation span.
+Each role is configured with env vars (see .env.example):
+
+    PRO_BASE_URL / PRO_MODEL / PRO_API_KEY / PRO_TIMEOUT_S        (default: Ollama, llama3.2:3b)
+    CON_BASE_URL / CON_MODEL / CON_API_KEY / CON_TIMEOUT_S        (default: Ollama, llama3.2:3b)
+    JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY / JUDGE_TIMEOUT_S (default: Groq, gpt-oss-120b)
+
+Layers of one client, outside in:
+
+    wrap_openai  → one generation span per create() call (so every retry is its own span)
+    FaultyCompletions → ARENA_* failure injection (inside the span, so it looks real)
+    openai.OpenAI(max_retries=0) → the real HTTP call; *we* retry, so each attempt is visible
+
+`chat()` turns provider errors into the arena's own error types and retries them:
+429 rate limits with Retry-After / exponential backoff, timeouts and 5xx once.
 """
 
-import hashlib
 import os
 import random
-import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal, NoReturn
+
+import openai
 
 import argus
-from arena.faults import Faults, LLMTimeout
+from arena.faults import Faults, LLMError, LLMRateLimited, LLMTimeout, LLMUnavailable
 
-DEFAULT_MODELS = {
-    "fake": {"pro": "fake-small", "con": "fake-large", "judge": "fake-large"},
-    "ollama": {"pro": "llama3.1", "con": "llama3.1", "judge": "llama3.1"},
-    "openai": {"pro": "gpt-4o-mini", "con": "gpt-4o-mini", "judge": "gpt-4o-mini"},
+Role = Literal["pro", "con", "judge"]
+ROLES: tuple[Role, ...] = ("pro", "con", "judge")
+
+OLLAMA_URL = "http://host.docker.internal:11434/v1/"
+GROQ_URL = "https://api.groq.com/openai/v1"
+
+# Defaults per role: (base_url, model, api_key, timeout seconds). CPU-only Ollama can take
+# minutes for one answer when two debates share the CPU, hence the long timeout.
+DEFAULTS: dict[Role, tuple[str, str, str, float]] = {
+    "pro": (OLLAMA_URL, "llama3.2:3b", "ollama", 300.0),
+    "con": (OLLAMA_URL, "llama3.2:3b", "ollama", 300.0),
+    "judge": (GROQ_URL, "openai/gpt-oss-120b", "", 60.0),
 }
 
-
-def provider() -> str:
-    return os.environ.get("LLM_PROVIDER", "fake")
-
-
-def default_model(role: str) -> str:
-    return os.environ.get(f"{role.upper()}_MODEL") or DEFAULT_MODELS[provider()][role]
+# 429 handling: up to RATE_LIMIT_RETRIES extra attempts; waits capped at MAX_WAIT_S.
+RATE_LIMIT_RETRIES = int(os.environ.get("LLM_RATE_LIMIT_RETRIES", "4"))
+MAX_WAIT_S = 60.0
+_sleep = time.sleep  # replaced in tests
 
 
-# --- fake provider: OpenAI-shaped responses, deterministic, offline --------------------------
+class ConfigError(RuntimeError):
+    pass
 
 
-@dataclass
-class FakeMessage:
-    content: str
-    role: str = "assistant"
-
-    def model_dump(self, mode: str = "python") -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
-
-
-@dataclass
-class FakeChoice:
-    message: FakeMessage
-    finish_reason: str = "stop"
-
-
-@dataclass
-class FakeUsage:
-    prompt_tokens: int
-    completion_tokens: int
-
-
-@dataclass
-class FakeResponse:
+@dataclass(frozen=True)
+class RoleConfig:
+    role: Role
+    base_url: str
     model: str
-    choices: list[FakeChoice]
-    usage: FakeUsage
-    id: str = field(default="fake")
+    api_key: str
+    timeout_s: float
+
+    def __repr__(self) -> str:  # never show the key, even in a traceback or debug print
+        return f"RoleConfig({self.role}, {self.base_url}, {self.model}, timeout={self.timeout_s})"
 
 
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)  # ~4 characters per token for English
-
-
-OPENERS = [
-    "Let me be direct.", "Consider the evidence.", "My opponent misses the point.",
-    "History is on our side.", "Look at the numbers.", "Think about everyday life.",
-]  # fmt: skip
-POINTS = [
-    "it leads to better outcomes for most people",
-    "the long-term costs are routinely underestimated",
-    "the strongest studies point the same way",
-    "it scales in a way the alternative never has",
-    "the people most affected consistently prefer it",
-    "the risks are real but manageable with simple rules",
-]
-CLOSERS = [
-    "That is why this side should win.", "The burden of proof has not been met.",
-    "On balance, the case is clear.", "No serious objection survives this.",
-]  # fmt: skip
-
-
-def _fake_argument(prompt: str, rng: random.Random) -> str:
-    topic = m.group(1) if (m := re.search(r"Topic: (.+)", prompt)) else "this motion"
-    stance = "against" if "AGAINST" in prompt else "for"
-    fact = m.group(1) if (m := re.search(r"Fact: (.+)", prompt)) else None
-    points = rng.sample(POINTS, 2)
-    text = (f"{rng.choice(OPENERS)} I argue {stance} '{topic}' because {points[0]}, "
-            f"and because {points[1]}.")  # fmt: skip
-    if fact:
-        text += f" Remember: {fact}."
-    return f"{text} {rng.choice(CLOSERS)}"
-
-
-def _fake_verdict(rng: random.Random) -> str:
-    pro, con = rng.randint(4, 9), rng.randint(4, 9)
-    winner = "pro" if pro > con else "con" if con > pro else "tie"
-    reasoning = rng.choice(
-        ["The winning side used more concrete evidence.",
-         "Both were persuasive; one rebutted more directly.",
-         "The stronger side engaged with the opponent's best points."]
-    )  # fmt: skip
-    return f'{{"winner": "{winner}", "scores": {{"pro": {pro}, "con": {con}}}, "reasoning": "{reasoning}"}}'  # noqa: E501
-
-
-class FakeCompletions:
-    def __init__(self, latency_s: float = 0.04) -> None:
-        self.latency_s = latency_s
-
-    def create(self, *, model: str, messages: list[dict[str, str]], **kwargs: Any) -> FakeResponse:
-        prompt = "\n".join(m["content"] for m in messages)
-        # Same input → same output: seed the RNG from a hash of the request.
-        seed = int.from_bytes(hashlib.sha256(f"{model}\n{prompt}".encode()).digest()[:8], "big")
-        rng = random.Random(seed)
-        if self.latency_s:
-            size = 2.0 if "large" in model else 1.0  # bigger models are slower
-            time.sleep(self.latency_s * size * rng.uniform(0.5, 1.5))
-        wants_json = (kwargs.get("response_format") or {}).get("type") == "json_object"
-        content = _fake_verdict(rng) if wants_json else _fake_argument(prompt, rng)
-        return FakeResponse(
-            model=model,
-            choices=[FakeChoice(FakeMessage(content))],
-            usage=FakeUsage(estimate_tokens(prompt) + 4 * len(messages), estimate_tokens(content)),
-        )
+def role_config(role: Role) -> RoleConfig:
+    url, model, key, timeout = DEFAULTS[role]
+    env = role.upper()
+    cfg = RoleConfig(
+        role=role,
+        base_url=os.environ.get(f"{env}_BASE_URL") or url,
+        model=os.environ.get(f"{env}_MODEL") or model,
+        api_key=os.environ.get(f"{env}_API_KEY") or key,
+        timeout_s=float(os.environ.get(f"{env}_TIMEOUT_S") or timeout),
+    )
+    if not cfg.api_key:
+        raise ConfigError(f"{env}_API_KEY is not set (for Groq: set GROQ_API_KEY in .env)")
+    return cfg
 
 
 # --- fault injection layer -------------------------------------------------------------------
@@ -153,37 +102,91 @@ class FaultyCompletions:
         return resp
 
 
-def make_client(faults: Faults | None = None, *, fake_latency_s: float | None = None) -> Any:
-    """An OpenAI-compatible client for LLM_PROVIDER, with faults injected and tracing on."""
-    name = provider()
-    if name == "fake":
-        latency = fake_latency_s
-        if latency is None:
-            latency = float(os.environ.get("FAKE_LATENCY_MS", "40")) / 1000
-        base: Any = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions(latency)))
-    elif name in ("ollama", "openai"):
-        from openai import OpenAI  # imported lazily: not needed for the fake provider
-
-        if name == "ollama":
-            url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-            base = OpenAI(base_url=url, api_key="ollama", timeout=120)
-        else:  # OPENAI_API_KEY from the environment; OPENAI_BASE_URL for other vendors
-            base = OpenAI(base_url=os.environ.get("OPENAI_BASE_URL") or None, timeout=60)
-    else:
-        raise ValueError(f"LLM_PROVIDER must be fake, ollama or openai, not {name!r}")
-
-    faulty = FaultyCompletions(base.chat.completions, faults or Faults.from_env())
+def wrap(completions: Any, faults: Faults) -> Any:
+    """Any object with `.create(**kwargs)` → fault layer → traced OpenAI-shaped client."""
+    faulty = FaultyCompletions(completions, faults)
     return argus.wrap_openai(SimpleNamespace(chat=SimpleNamespace(completions=faulty)))
+
+
+def make_client(cfg: RoleConfig, faults: Faults) -> Any:
+    # max_retries=0: the openai package would otherwise retry 429/5xx silently inside one
+    # span; our own loop in chat() makes every attempt a separate, visible span.
+    real = openai.OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=cfg.timeout_s,
+                         max_retries=0)  # fmt: skip
+    return wrap(real.chat.completions, faults)
+
+
+def make_clients(faults: Faults | None = None) -> dict[Role, tuple[RoleConfig, Any]]:
+    """Config + traced client for every role, built from the environment."""
+    faults = faults or Faults.from_env()
+    configs = {role: role_config(role) for role in ROLES}
+    return {role: (cfg, make_client(cfg, faults)) for role, cfg in configs.items()}
+
+
+# --- calling with retries --------------------------------------------------------------------
+
+
+def retry_after_s(exc: openai.APIStatusError) -> float | None:
+    """Seconds from the Retry-After header (Groq sends seconds), or None if absent/unusable."""
+    value = exc.response.headers.get("retry-after")
+    try:
+        return max(0.0, float(value)) if value is not None else None
+    except ValueError:  # an HTTP date: rare, fall back to backoff
+        return None
+
+
+def backoff_s(attempt: int) -> float:
+    """Exponential backoff with full jitter: uniform(0, min(MAX_WAIT_S, 2 s * 2^attempt))."""
+    return random.uniform(0, min(MAX_WAIT_S, 2.0 * 2**attempt))
+
+
+def _classify(exc: Exception) -> LLMError | None:
+    """Map a provider error to the arena's error types; None = not retryable (re-raise)."""
+    if isinstance(exc, LLMError):
+        return exc  # injected fault
+    if isinstance(exc, openai.RateLimitError):
+        return LLMRateLimited(str(exc)[:300])
+    if isinstance(exc, openai.APITimeoutError):  # subclass of APIConnectionError: check first
+        return LLMTimeout(str(exc)[:300])
+    if isinstance(exc, openai.APIConnectionError | openai.InternalServerError):
+        return LLMUnavailable(str(exc)[:300])
+    return None
+
+
+def _give_up(err: LLMError, exc: Exception) -> NoReturn:
+    if err is exc:
+        raise err
+    raise err from exc
 
 
 def chat(client: Any, model: str, messages: list[dict[str, str]], *, retries: int = 1,
          **kwargs: Any) -> str:  # fmt: skip
-    """One LLM call, retried on timeout. Every attempt is its own generation span."""
-    for attempt in range(retries + 1):
+    """One LLM call with retries. Every attempt is its own generation span.
+
+    429: up to RATE_LIMIT_RETRIES retries, waiting Retry-After (or backoff), capped at 60 s.
+    Timeouts, connection errors and 5xx: `retries` retries (default 1) after a short backoff.
+    When retries run out, raises LLMRateLimited / LLMTimeout / LLMUnavailable.
+    """
+    attempt = transient = limited = 0
+    while True:
+        attempt += 1
         try:
-            resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
+            with argus.attributes(llm_attempt=attempt):  # → metadata of the generation span
+                resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
             return resp.choices[0].message.content or ""
-        except LLMTimeout:
-            if attempt == retries:
-                raise
-    raise AssertionError("unreachable")
+        except Exception as exc:
+            err = _classify(exc)
+            if err is None:
+                raise  # 4xx other than 429 (bad request, auth): retrying can't help
+            if isinstance(err, LLMRateLimited):
+                if limited >= RATE_LIMIT_RETRIES:
+                    _give_up(err, exc)
+                header = retry_after_s(exc) if isinstance(exc, openai.APIStatusError) else None
+                wait = min(MAX_WAIT_S, header if header is not None else backoff_s(limited))
+                limited += 1
+            else:
+                if transient >= retries:
+                    _give_up(err, exc)
+                wait = backoff_s(transient) / 4  # short: the next attempt has its own timeout
+                transient += 1
+            _sleep(wait)

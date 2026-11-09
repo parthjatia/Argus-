@@ -37,15 +37,15 @@ The Debate Arena is a small demo app whose only job is to produce realistic LLM 
 - **Judge agent:** A third LLM reads the debate and must answer in fixed JSON: `{winner, scores, reasoning}`.
   - **Why:** Structured output is one of the most common failure points in real AI apps.
   - **What happens on bad JSON:** Pydantic rejects it and the judge is asked once more. Both attempts appear in the trace.
-- **`lookup_fact()` tool:** A fake fact lookup the agents call for evidence.
+- **`lookup_fact()` tool:** A simulated fact lookup (not an LLM) the agents call for evidence.
   - **Why:** Real agents call tools, and tools fail. Because you wrote it, you control when it is slow or broken.
-- **LLM provider switch (`LLM_PROVIDER`):**
-  - `fake` returns instant canned answers with realistic token counts. Used for tests and load tests: free, fast and predictable.
-  - `ollama` runs real models locally for free.
-  - A paid API is optional, to show real costs.
+- **Real models only, one client per role:**
+  - Pro and con: `llama3.2:3b` on a local Ollama (free, slow on CPU, so long timeouts).
+  - Judge: `openai/gpt-oss-120b` on Groq's free tier (fast, but rate limited, so 429s are retried with `Retry-After`).
+  - Tests use a small stub LLM inside `demo/tests/`; load and chaos tests send synthetic spans and call no LLM.
 - **Failure switches:** `ARENA_TIMEOUT_RATE`, `ARENA_BAD_JSON_RATE` and `ARENA_SLOW_RATE` make a chosen share of calls fail or slow down.
   - **Why:** A demo where nothing breaks proves nothing. Injected failures show that Argus captures errors and retries.
-- **Traffic generator (`make traffic N=50`):** Runs many debates in parallel.
+- **Traffic generator (`make traffic N=10`):** Runs many real debates, 2 at a time by default.
   - **Why:** It fills the dashboard with enough data for charts, and it stress-tests the pipeline.
 
 ## 2. Argus SDK: the recorder inside your app
@@ -219,7 +219,6 @@ The foundation is done and the ingest endpoint is being built. Update the Status
 | API key check and `POST /v1/ingest` | 1 | In progress |
 | Python SDK | 2 | Not started |
 | Redis Stream and worker | 3 | Not started |
-| Debate Arena with fake provider, failure switches and traffic | 3 | Not started |
-| Ollama provider (optional) | 3 | Not started |
+| Debate Arena with real models (Ollama + Groq), failure switches and traffic | 3 | Done |
 | Read API and dashboard | 4 | Not started |
 | Chaos test, load test and README | 5 | Not started |

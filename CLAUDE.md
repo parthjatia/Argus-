@@ -5,7 +5,8 @@ A Python SDK records every model call and tool call as nested spans. A FastAPI +
 pipeline ingests them, and a Next.js dashboard shows traces, costs, latency and errors.
 
 The repo also contains the **AI Debate Arena**: a demo multi-agent app (two LLMs debate, a third judges)
-that exists only to produce realistic traces, including injected failures.
+that exists only to produce realistic traces, including injected failures. It uses **real models
+only** (Ollama debaters, Groq judge); there is no fake/canned LLM provider in the app.
 
 This is a one-person portfolio project, built in about one week. Favour simple, correct and
 well-explained code over clever or "enterprise" code.
@@ -42,7 +43,7 @@ I'm building this to learn and to explain it in interviews. Follow these rules:
 | Buffer | Redis Streams (consumer group) |
 | Database | PostgreSQL (JSONB for prompts/outputs) |
 | Dashboard | Next.js (App Router) + TypeScript, Tailwind, Recharts |
-| Demo LLMs | `fake` provider (offline, deterministic), Ollama (OpenAI-compatible API), optional paid API |
+| Demo LLMs | Real models only, OpenAI-compatible: Ollama `llama3.2:3b` (pro, con), Groq `openai/gpt-oss-120b` (judge) |
 | Tooling | Docker Compose, pytest, ruff, k6 or Locust for load tests |
 
 Ports: server `8000`, dashboard `3000`, Postgres `5432`, Redis `6379`, Ollama `11434` (host).
@@ -86,7 +87,7 @@ argus/
 │   ├── app/streams.py        # stream / group names + per-minute rate counters (API and worker)
 │   ├── app/storage.py        # idempotent batch INSERT + cost from model_prices
 │   ├── worker/consumer.py    # Redis Stream → Postgres batch writer
-│   ├── migrations/           # plain SQL files, applied in order (0002 = example prices)
+│   ├── migrations/           # plain SQL files, applied in order (0002 = example prices, 0003 = free real models)
 │   └── tests/
 ├── dashboard/                # Next.js 15 (App Router) + Tailwind 4 + Recharts 3: "control room"
 │   ├── app/page.tsx          # Overview: tiles, live feed, running debates, cost/error bars
@@ -101,12 +102,12 @@ argus/
 │   ├── arena/
 │   │   ├── debate.py         # one debate = one trace (python -m arena.debate)
 │   │   ├── agents.py         # debater + judge prompts, JudgeVerdict validation + retry
-│   │   ├── tools.py          # fake lookup_fact() with failure injection
+│   │   ├── tools.py          # simulated lookup_fact() tool (not an LLM) with failure injection
 │   │   ├── faults.py         # ARENA_* failure injection settings
-│   │   └── llm.py            # provider switch: fake | ollama | openai (+ fault layer)
+│   │   └── llm.py            # per-role real clients (Ollama/Groq), 429 + timeout retries, fault layer
 │   ├── topics.yaml
-│   ├── traffic.py            # runs many debates to generate traces
-│   └── tests/
+│   ├── traffic.py            # runs many real debates, concurrency limit (default 2)
+│   └── tests/                # conftest.py holds the only stub LLM (tests only)
 └── loadtest/                # ingest.js (k6), run_load.py, chaos.py, results/
 ```
 
@@ -267,10 +268,16 @@ actually inserted (`RETURNING`), so duplicate events never double-count cost.
   `lookup_fact()` call a tool span.
 - The judge returns JSON `{winner, scores, reasoning}` validated with Pydantic. On invalid JSON,
   retry once. Both attempts must be visible in the trace.
-- `LLM_PROVIDER=fake|ollama|openai` (Ollama and paid APIs via an OpenAI-compatible base URL).
-  The `fake` provider returns canned answers with realistic token counts, for tests and load tests.
+- Real models only, one OpenAI-compatible client per role (wrapped with `wrap_openai`), set in `.env`:
+  `PRO_*` / `CON_*`: Ollama at `http://host.docker.internal:11434/v1/`, `llama3.2:3b`, key `ollama`;
+  `JUDGE_*`: Groq at `https://api.groq.com/openai/v1`, `openai/gpt-oss-120b`, key from `GROQ_API_KEY`
+  (never print, log or commit it). Each role: `<ROLE>_BASE_URL`, `_MODEL`, `_API_KEY`, `_TIMEOUT_S`.
+- 429s retried with `Retry-After` / backoff, timeouts + 5xx once; every attempt is its own span.
+  Timeouts: 300 s for CPU-only Ollama, 60 s for Groq.
+- Tests use a stub LLM in `demo/tests/conftest.py` only. Load and chaos tests send synthetic
+  spans and never call an LLM.
 - Failure injection via env vars: `ARENA_TIMEOUT_RATE`, `ARENA_BAD_JSON_RATE`, `ARENA_SLOW_RATE`.
-- `traffic.py` runs N debates in parallel to fill the dashboard.
+- `traffic.py` runs N real debates, at most `--concurrency` (default 2) at a time, so Groq's free limits hold.
 
 ## Dashboard ("control room")
 
@@ -301,8 +308,8 @@ cp .env.example .env
 docker compose up -d --build      # postgres, redis, server, worker, dashboard
 make migrate                      # apply SQL migrations
 make seed                         # create a demo project + print its API key
-make demo TOPIC="..."             # one debate (LLM_PROVIDER from .env, default fake)
-make traffic N=50                 # run many debates (FAKE_LATENCY_MS=1500 for long, "live" debates)
+make demo TOPIC="..."             # one real debate (Ollama on the host + GROQ_API_KEY in .env)
+make traffic N=10                 # many real debates, CONCURRENCY=2 at a time
 make test                         # pytest for sdk + server
 make lint                         # ruff
 make load                         # k6 load test of the ingestion API (VUS=20 DURATION=30s)
@@ -335,7 +342,7 @@ make chaos                        # kill/restart worker + API during traffic, ch
 2. **Day 2:** SDK: context nesting, `@observe`, exporter with batching and retries,
    `wrap_openai`. Unit tests.
 3. **Day 3:** Redis Stream + worker (consumer group, XACK, XAUTOCLAIM). Debate Arena with the
-   fake provider and failure injection. `traffic.py`.
+   real models (Ollama + Groq) and failure injection. `traffic.py`.
 4. **Day 4:** Dashboard: trace list, waterfall view, span detail, metrics page.
 5. **Day 5:** Load test, README (architecture diagram, design decisions, measured numbers),
    demo GIF. Stretch: PII redaction in the SDK, or prompt replay and compare.
@@ -386,12 +393,19 @@ make chaos                        # kill/restart worker + API during traffic, ch
 | Poison messages: batch retried row by row, bad ones to the `spans:dead` stream + `XACK` | One bad message can't block ingestion forever | Dead letters need manual inspection |
 | `cost_usd` computed inside the `INSERT` (scalar subquery on `model_prices`, latest `valid_from <= start_time`) | One statement, always the current price table, no cache to go stale; history keeps the price that applied then | Price changes don't re-price stored spans (by design) |
 | No price or no tokens: `cost_usd` NULL; free models priced explicitly at 0 | "Unknown" and "free" are different facts | Unpriced models show no cost until a price row is added |
-| Arena: every provider (including `fake`) is an OpenAI-shaped client wrapped by `wrap_openai` | One code path; the fake provider produces the same span shapes as Ollama/OpenAI | The fake mimics only the response fields we use |
+| Arena: real models only; one OpenAI-compatible client per role (`<ROLE>_BASE_URL/_MODEL/_API_KEY/_TIMEOUT_S`), all wrapped by `wrap_openai` | Traces show real latency, tokens and rate limits; per role so cheap local debaters and a strong hosted judge mix | Demo needs Ollama + a Groq key; a debate takes ~2 min on CPU |
+| `openai.OpenAI(max_retries=0)`; `chat()` retries itself: 429 up to 4× (`Retry-After`, else full-jitter backoff, ≤ 60 s each), timeout / connection / 5xx once, other 4xx never | The SDK's hidden retries would merge attempts into one span; now each attempt is a generation span (`metadata.llm_attempt`) | A long 429 storm fails the turn (or the judge → the debate) |
+| Timeouts: 300 s for Ollama roles, 60 s for Groq | CPU-only inference takes 13-30 s per answer, longer with two debates sharing the CPU | A hung Ollama call blocks its debate for up to 5 min |
+| `traffic.py` concurrency 2 by default | Keeps Ollama responsive and Groq's free tier (RPM / TPM) under its limits | Slow to fill the dashboard |
+| Stub LLM only in `demo/tests/conftest.py`; load/chaos tests send synthetic spans (model `synthetic-llm`) | The app has no fake code path; tests and pipeline tests run without any model | The stub mimics only the response fields we use |
+| Server tests insert their own `test-small` / `test-large` prices (conftest) | Cost tests don't depend on real price rows changing | Duplicates a few rows of price data |
+| Free models priced explicitly at 0 (`0003_real_model_prices.sql`), old `fake-*` prices deleted there | Cost shows `$0` (known free), not "unknown" | Re-check if a model leaves a free tier |
 | Faults are injected in a client layer *inside* `wrap_openai` | Injected timeouts and slowness appear in the generation span, like real ones |  |
 | Judge: JSON mode + Pydantic `JudgeVerdict`; one retry that includes the validation error; each attempt is a `judge.attempt` span | Both attempts visible in the trace; the retry tells the model what was wrong | Two invalid answers fail the debate (`JudgeFailed`) |
 | LLM timeouts retried once per call; a turn that still fails is recorded and the debate continues; a failed judge fails the debate | A realistic mix of partial failures and failed traces |  |
 | `traffic.py` uses threads | Each thread starts with an empty context, so each debate is its own trace |  |
-| Demo dependencies: PyYAML (topics), `openai` (only for ollama/openai, imported lazily) | Well-known; the fake provider needs no network or API key |  |
+| Demo dependencies: PyYAML (topics), `openai` (client for Ollama and Groq) | Well-known; the official client handles both OpenAI-compatible APIs |  |
+| Shell variables override `.env` in `docker compose` | Compose's documented precedence | A stale `ARGUS_API_KEY` in the terminal makes spans fail with 401; unset it |
 | Read API uses the same `X-API-Key` auth; the dashboard calls it only from server components with `ARGUS_API_KEY` from its env | One auth mechanism; the key never reaches the browser | The dashboard shows a single project (the key's) |
 | Trace status = root span status (fallback: any span failed while the root is missing) | A trace that recovered from a failed child is a success; failed children are counted separately | `status=error` filters on the root, not on "any error" |
 | Keyset pagination on `(start_time, trace_id)`, opaque base64 cursor, `limit + 1` probe | Stable pages while new traces keep arriving; no `OFFSET` scans | Only "next" and "first page" navigation |

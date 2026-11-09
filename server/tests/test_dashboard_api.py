@@ -63,7 +63,7 @@ def span(trace: UUID, name: str, start: float, dur: float = 1.0, parent: UUID | 
 
 
 def debate_children(trace: UUID, root: UUID, start: float = -10) -> list[SpanIn]:
-    common = {"topic": "Cats vs dogs", "rounds": 3, "pro_model": "fake-small"}
+    common = {"topic": "Cats vs dogs", "rounds": 3, "pro_model": "test-small"}
     return [
         span(trace, "debate.turn", start, 1, root, metadata=common | {"round": 1, "role": "pro"}),
         span(
@@ -73,7 +73,7 @@ def debate_children(trace: UUID, root: UUID, start: float = -10) -> list[SpanIn]
             1,
             root,
             kind="generation",
-            model="fake-small",
+            model="test-small",
             input_tokens=100,
             output_tokens=50,
             metadata=common | {"round": 2, "role": "con"},
@@ -102,7 +102,7 @@ def test_live_lists_traces_without_root_and_recent_activity(dash: Dash) -> None:
     assert t["input_tokens"] == 100 and t["output_tokens"] == 50
     assert t["total_cost_usd"] == pytest.approx((100 * 0.10 + 50 * 0.40) / 1e6)
     # Metadata merged across spans, the newest span's values winning.
-    assert t["attributes"] == {"topic": "Cats vs dogs", "rounds": 3, "pro_model": "fake-small",
+    assert t["attributes"] == {"topic": "Cats vs dogs", "rounds": 3, "pro_model": "test-small",
                                "round": 2, "role": "con"}  # fmt: skip
     assert t["latest_span"]["name"] == "openai.chat.completions"
     assert t["latest_span"]["kind"] == "generation"
@@ -139,7 +139,7 @@ def test_recent_spans_newest_first_without_payloads(dash: Dash) -> None:
 def test_summary_counts_only_the_range(dash: Dash) -> None:
     t1, r1 = uuid4(), uuid4()
     dash.store([span(t1, "debate", -60, 2, span_id=r1, status="error"),
-                span(t1, "llm", -59, 1, r1, kind="generation", model="fake-small",
+                span(t1, "llm", -59, 1, r1, kind="generation", model="test-small",
                      input_tokens=1000, output_tokens=1000)])  # fmt: skip
     old = uuid4()
     dash.store([span(old, "debate", -7200, 1)])  # 2 h ago: outside the default 1 h
@@ -180,7 +180,7 @@ def test_range_validation(dash: Dash) -> None:
 
 def test_cost_by_model_and_model_stats(dash: Dash) -> None:
     t = uuid4()
-    gens = [span(t, "llm", -100 + i, 0.1 * (i + 1), kind="generation", model="fake-large",
+    gens = [span(t, "llm", -100 + i, 0.1 * (i + 1), kind="generation", model="test-large",
                  input_tokens=1000, output_tokens=0, status="error" if i == 0 else "ok")
             for i in range(4)]  # fmt: skip
     gens.append(span(t, "llm", -50, 0.2, kind="generation", model="free-model"))
@@ -190,10 +190,10 @@ def test_cost_by_model_and_model_stats(dash: Dash) -> None:
     by_model = {}
     for row in cost:
         by_model.setdefault(row["model"], []).append(row)
-    assert sum(r["calls"] for r in by_model["fake-large"]) == 4
+    assert sum(r["calls"] for r in by_model["test-large"]) == 4
 
     stats = {m["model"]: m for m in dash.get("/v1/metrics/models")}
-    large = stats["fake-large"]
+    large = stats["test-large"]
     assert (large["calls"], large["errors"], large["error_rate"]) == (4, 1, 0.25)
     assert large["avg_ms"] == pytest.approx(250, abs=1)
     assert large["input_tokens"] == 4000
@@ -204,11 +204,11 @@ def test_cost_by_model_and_model_stats(dash: Dash) -> None:
 def test_breakdown_by_attribute(dash: Dash) -> None:
     t = uuid4()
     dash.store([
-        span(t, "llm", -10, 1, kind="generation", model="fake-small", input_tokens=1_000_000,
+        span(t, "llm", -10, 1, kind="generation", model="test-small", input_tokens=1_000_000,
              output_tokens=0, metadata={"role": "pro"}),
-        span(t, "llm", -9, 1, kind="generation", model="fake-small", input_tokens=2_000_000,
+        span(t, "llm", -9, 1, kind="generation", model="test-small", input_tokens=2_000_000,
              output_tokens=0, metadata={"role": "judge"}),
-        span(t, "llm", -8, 1, kind="generation", model="fake-small"),
+        span(t, "llm", -8, 1, kind="generation", model="test-small"),
     ])  # fmt: skip
     rows = dash.get("/v1/metrics/breakdown", attribute="role")
     assert [(r["value"], r["cost_usd"]) for r in rows] == [

@@ -6,6 +6,7 @@ test("formatDuration", () => {
   assert.equal(formatDuration(0), "0 ms");
   assert.equal(formatDuration(0.4), "<1 ms");
   assert.equal(formatDuration(245.6), "246 ms");
+  assert.equal(formatDuration(119_600), "2m 0s"); // no "1m 60s"
   assert.equal(formatDuration(1240), "1.24 s");
   assert.equal(formatDuration(12_400), "12.4 s");
   assert.equal(formatDuration(125_000), "2m 5s");

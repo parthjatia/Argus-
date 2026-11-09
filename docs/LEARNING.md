@@ -308,3 +308,47 @@ reclaims the messages and the row count doesn't change. We also killed the live 
   forever.
 - Polling from the browser straight to the API: the API key would have to be in the browser.
 - Not pausing when hidden: 50 open tabs would poll the server all day for nobody.
+
+---
+
+## 10. Real LLM calls: per-role clients, 429s and timeouts (`demo/arena/llm.py`)
+
+The Debate Arena uses only real models: both debaters are `llama3.2:3b` on a local Ollama, the
+judge is `openai/gpt-oss-120b` on Groq. Both speak the OpenAI API, so one code path serves both.
+
+**How it works**
+
+- **One client per role.** `role_config("pro" | "con" | "judge")` reads `<ROLE>_BASE_URL`,
+  `<ROLE>_MODEL`, `<ROLE>_API_KEY` and `<ROLE>_TIMEOUT_S` (defaults: Ollama for pro/con, Groq
+  for the judge; docker compose passes `GROQ_API_KEY` in as `JUDGE_API_KEY`). The config's
+  `repr` hides the key, and the root span records only base URLs, never keys.
+- **Three layers per client:** `wrap_openai` (one generation span per call) → fault injection
+  (`ARENA_*`) → `openai.OpenAI(max_retries=0)`. The `openai` package normally retries 429s and
+  5xx by itself, *inside* one call, so those retries would be invisible in the trace. With
+  `max_retries=0` our own loop in `chat()` retries, and every attempt is its own span with
+  `metadata.llm_attempt = 1, 2, …`.
+- **429 Too Many Requests:** wait for the `Retry-After` header if the provider sends one (Groq
+  does), otherwise exponential backoff with full jitter; each wait is capped at 60 s, up to
+  `LLM_RATE_LIMIT_RETRIES` (4) retries. Timeouts, connection errors and 5xx are retried once.
+  Other 4xx (wrong key, bad request) are **not** retried: they can't succeed.
+- **Errors become arena types:** `LLMRateLimited`, `LLMTimeout`, `LLMUnavailable` (all
+  `LLMError`). A debater's failed turn is recorded and the debate goes on; a failed judge fails
+  the debate.
+- **Timeouts sized for CPU inference:** 300 s per debater call (one answer takes 13-30 s on CPU,
+  more with two debates sharing the CPU), 60 s for Groq.
+- **Concurrency limit:** `traffic.py` runs at most 2 debates at a time (`--concurrency`), so
+  Ollama isn't swamped and Groq's free-tier limits (requests and tokens per minute) hold.
+- **Tests never call a model:** a tiny stub LLM lives in `demo/tests/conftest.py`, outside the
+  app package. Load and chaos tests send synthetic spans straight to the API.
+
+**What would break without it**
+
+- Without `max_retries=0`: a 429 retried inside the `openai` package would look like one slow,
+  successful call; you couldn't see rate limiting in the trace at all.
+- Ignoring `Retry-After`: retrying too early just earns another 429 (and wastes quota);
+  retrying in lockstep without jitter makes parallel debates hit the limit together.
+- Retrying 4xx: a wrong API key would be "retried" five times before failing anyway.
+- Default (short) timeouts: CPU-only Ollama would time out on long transcripts and every
+  debate would fail.
+- No concurrency limit: 50 parallel debates would queue on one CPU and blow through Groq's
+  per-minute limits.

@@ -81,7 +81,8 @@ services:
     depends_on:
       - server
 
-  # Debate Arena. Not started by `up` (profile); used via `make demo` / `make traffic`.
+  # Debate Arena (real models only). Not started by `up` (profile); used via `make demo` /
+  # `make traffic`. Pro/con: Ollama on the host; judge: Groq (key from GROQ_API_KEY in .env).
   demo:
     profiles: ["tools"]
     build:
@@ -90,18 +91,23 @@ services:
     environment:
       ARGUS_HOST: http://server:8000
       ARGUS_API_KEY: ${ARGUS_API_KEY:-}
-      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      PRO_BASE_URL: ${PRO_BASE_URL:-http://host.docker.internal:11434/v1/}
+      PRO_MODEL: ${PRO_MODEL:-llama3.2:3b}
+      PRO_API_KEY: ${PRO_API_KEY:-ollama}
+      PRO_TIMEOUT_S: ${PRO_TIMEOUT_S:-300}
+      CON_BASE_URL: ${CON_BASE_URL:-http://host.docker.internal:11434/v1/}
+      CON_MODEL: ${CON_MODEL:-llama3.2:3b}
+      CON_API_KEY: ${CON_API_KEY:-ollama}
+      CON_TIMEOUT_S: ${CON_TIMEOUT_S:-300}
+      JUDGE_BASE_URL: ${JUDGE_BASE_URL:-https://api.groq.com/openai/v1}
+      JUDGE_MODEL: ${JUDGE_MODEL:-openai/gpt-oss-120b}
+      JUDGE_API_KEY: ${JUDGE_API_KEY:-${GROQ_API_KEY:-}}  # secret: only via .env
+      JUDGE_TIMEOUT_S: ${JUDGE_TIMEOUT_S:-60}
+      LLM_RATE_LIMIT_RETRIES: ${LLM_RATE_LIMIT_RETRIES:-4}
       ARENA_TIMEOUT_RATE: ${ARENA_TIMEOUT_RATE:-0}
       ARENA_BAD_JSON_RATE: ${ARENA_BAD_JSON_RATE:-0}
       ARENA_SLOW_RATE: ${ARENA_SLOW_RATE:-0}
       ARENA_SLOW_SECONDS: ${ARENA_SLOW_SECONDS:-2}
-      FAKE_LATENCY_MS: ${FAKE_LATENCY_MS:-40}  # fake provider: base latency per LLM call
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      PRO_MODEL: ${PRO_MODEL:-}
-      CON_MODEL: ${CON_MODEL:-}
-      JUDGE_MODEL: ${JUDGE_MODEL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"  # reach Ollama on the host (Linux too)
     volumes:

@@ -155,15 +155,16 @@ def _cost(db: str, span: SpanIn) -> Decimal | None:
 
 def test_cost_uses_price_valid_at_start_time(make_worker, migrated_db, project) -> None:
     w = make_worker()
-    # Seeded: fake-large = $1.00 / $4.00 per 1M from 2024-01-01, $0.80 / $3.20 from 2026-06-01.
-    old = make_span(kind="generation", model="fake-large", input_tokens=1000,
+    # Test prices (conftest): test-large = $1.00 / $4.00 per 1M from 2024-01-01,
+    # $0.80 / $3.20 from 2026-06-01.
+    old = make_span(kind="generation", model="test-large", input_tokens=1000,
                     output_tokens=500, start_time=datetime(2025, 1, 1, tzinfo=UTC),
                     end_time=datetime(2025, 1, 1, 0, 0, 1, tzinfo=UTC))  # fmt: skip
-    new = make_span(kind="generation", model="fake-large", input_tokens=1000,
+    new = make_span(kind="generation", model="test-large", input_tokens=1000,
                     output_tokens=500, start_time=datetime(2026, 7, 1, tzinfo=UTC),
                     end_time=datetime(2026, 7, 1, 0, 0, 1, tzinfo=UTC))  # fmt: skip
     unknown = make_span(kind="generation", model="mystery-model", input_tokens=1000)
-    no_tokens = make_span(kind="generation", model="fake-large")
+    no_tokens = make_span(kind="generation", model="test-large")
     enqueue(w.r, project, [old, new, unknown, no_tokens])
     w.drain()
 

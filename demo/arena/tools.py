@@ -1,4 +1,4 @@
-"""A fake fact-lookup tool, so traces contain realistic tool spans (and tool failures)."""
+"""A simulated fact-lookup tool (not an LLM), so traces contain tool spans and tool failures."""
 
 import hashlib
 import time

@@ -8,6 +8,9 @@ Run from the repo root with the stack up (`docker compose up -d`):
 Standard library only, because it runs on the host: it needs `docker compose` to kill
 containers, and talks to the API on localhost:8000.
 
+No LLM is called: spans are synthetic (model "synthetic-llm", no price row → cost NULL),
+so the test runs without Ollama or Groq and never touches their rate limits.
+
 How it works
   * Sender threads POST batches with SDK-style UUIDv4 span IDs. Like the SDK, a sender
     retries the SAME batch (same IDs) on network errors and 5xx until it gets 202, so
@@ -101,7 +104,7 @@ def make_batch(spans_per_batch: int) -> tuple[bytes, list[str]]:
                 "start_time": start.isoformat(),
                 "end_time": (start + timedelta(milliseconds=8)).isoformat(),
                 "status": "ok",
-                "model": "fake-small" if generation else None,
+                "model": "synthetic-llm" if generation else None,
                 "input": {"prompt": "x" * 200} if generation else {},
                 "output": {"text": "y" * 200} if generation else {},
                 "input_tokens": 120 if generation else None,
