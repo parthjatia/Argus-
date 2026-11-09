@@ -1,0 +1,318 @@
+# CLAUDE.md — Argus: LLM Observability Platform
+
+Argus is a self-hosted tracing tool for LLM applications (a small, focused Langfuse).
+A Python SDK records every model call and tool call as nested spans. A FastAPI + Redis + Postgres
+pipeline ingests them, and a Next.js dashboard shows traces, costs, latency and errors.
+
+The repo also contains the **AI Debate Arena**: a demo multi-agent app (two LLMs debate, a third judges)
+that exists only to produce realistic traces, including injected failures.
+
+This is a one-person portfolio project, built in about one week. Favour simple, correct and
+well-explained code over clever or "enterprise" code.
+
+---
+
+## Working agreement for Claude (read first)
+
+I'm building this to learn and to explain it in interviews. Follow these rules:
+
+1. **Core components: explain before coding.** For the SDK context/nesting, the SDK exporter,
+   ingestion idempotency and the Redis Stream worker, first describe the design in a few bullets
+   and wait for my OK. Then implement in small steps.
+2. **After each core piece**, explain how it works and what would break if a key line were removed.
+3. **Boilerplate and UI can be generated freely**: Docker, configs, dashboard pages, charts, demo app.
+4. **Small changes, one concern at a time.** Run the relevant tests after every change.
+5. **Ask before adding a new dependency.** Prefer the standard library where reasonable.
+6. **Never put secrets in code.** Use `.env` (git-ignored) and keep `.env.example` up to date.
+7. **Update the "Design decisions" section** below whenever we make a non-obvious choice.
+8. If something in this file is wrong or outdated, tell me and propose an edit.
+
+---
+
+## Stack
+
+| Area | Choice |
+|---|---|
+| SDK | Python 3.12, standard library (`contextvars`, `threading`, `queue`), `httpx` |
+| Server | FastAPI, Pydantic v2, `psycopg` (v3, async), Uvicorn |
+| Buffer | Redis Streams (consumer group) |
+| Database | PostgreSQL (JSONB for prompts/outputs) |
+| Dashboard | Next.js (App Router) + TypeScript, Tailwind, Recharts |
+| Demo LLMs | `fake` provider (offline, deterministic), Ollama (OpenAI-compatible API), optional paid API |
+| Tooling | Docker Compose, pytest, ruff, k6 or Locust for load tests |
+
+Ports: server `8000`, dashboard `3000`, Postgres `5432`, Redis `6379`, Ollama `11434` (host).
+
+---
+
+## Repository layout
+
+```
+argus/
+├── CLAUDE.md
+├── README.md                 # architecture diagram, design decisions, demo GIF
+├── docker-compose.yml        # postgres, redis, server, worker, dashboard
+├── .env.example
+├── Makefile
+├── sdk/                      # pip-installable package: argus
+│   ├── argus/
+│   │   ├── __init__.py       # init(), observe, span, wrap_openai
+│   │   ├── context.py        # contextvars: current trace/span
+│   │   ├── decorators.py     # @observe for sync + async functions
+│   │   ├── exporter.py       # bounded queue + background batch sender
+│   │   ├── models.py         # SpanEvent (Pydantic)
+│   │   └── integrations/openai.py   # wraps OpenAI-compatible clients
+│   └── tests/
+├── server/
+│   ├── app/
+│   │   ├── main.py           # FastAPI app
+│   │   ├── auth.py           # API key → project_id
+│   │   ├── api/ingest.py     # POST /v1/ingest
+│   │   ├── api/traces.py     # trace list + detail
+│   │   ├── api/metrics.py    # cost, latency, error rate
+│   │   ├── pricing.py        # cost from tokens using model_prices
+│   │   ├── schemas.py
+│   │   └── db.py
+│   ├── worker/consumer.py    # Redis Stream → Postgres batch writer
+│   ├── migrations/           # plain SQL files, applied in order
+│   └── tests/
+├── dashboard/                # Next.js app
+├── demo/
+│   ├── arena/
+│   │   ├── debate.py         # runs a debate: rounds, turns, judge
+│   │   ├── agents.py         # debater + judge prompts
+│   │   ├── tools.py          # fake lookup_fact() with failure injection
+│   │   └── llm.py            # provider switch: fake | ollama | openai
+│   ├── topics.yaml
+│   └── traffic.py            # runs many debates to generate traces
+└── loadtest/
+```
+
+---
+
+## Data flow
+
+```
+Demo app ──@observe──▶ SDK queue ──batch (HTTP)──▶ POST /v1/ingest ──XADD──▶ Redis Stream "spans"
+                                                       (202 Accepted)              │
+                                                                     XREADGROUP (group "writers")
+                                                                                   ▼
+                                                             worker: batch INSERT … ON CONFLICT DO NOTHING
+                                                                                   ▼
+                                                                    PostgreSQL ◀── server read API ◀── dashboard
+```
+
+---
+
+## Event format (SDK → server)
+
+The SDK sends a span **when it ends** (one event per finished span).
+
+```json
+{
+  "batch": [
+    {
+      "span_id": "01J…",            // ULID or UUIDv4, generated by the SDK
+      "trace_id": "01J…",
+      "parent_span_id": null,       // null = root span
+      "name": "debate.round",
+      "kind": "span",               // span | generation | tool
+      "start_time": "2026-11-10T10:00:00.123Z",
+      "end_time": "2026-11-10T10:00:01.456Z",
+      "status": "ok",               // ok | error
+      "error_message": null,
+      "model": null,                // set for kind=generation
+      "input": {},                  // JSON, truncated if large
+      "output": {},
+      "input_tokens": null,
+      "output_tokens": null,
+      "metadata": {}
+    }
+  ]
+}
+```
+
+---
+
+## Database schema (initial)
+
+```sql
+CREATE TABLE projects (
+  id UUID PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE api_keys (
+  id UUID PRIMARY KEY,
+  project_id UUID NOT NULL REFERENCES projects(id),
+  key_hash TEXT NOT NULL UNIQUE,          -- store a hash, never the raw key
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at TIMESTAMPTZ
+);
+
+CREATE TABLE spans (
+  id TEXT PRIMARY KEY,                    -- span_id from the SDK → idempotent inserts
+  trace_id TEXT NOT NULL,
+  project_id UUID NOT NULL REFERENCES projects(id),
+  parent_span_id TEXT,                    -- no FK: children may arrive before parents
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('span','generation','tool')),
+  start_time TIMESTAMPTZ NOT NULL,
+  end_time TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('ok','error')),
+  error_message TEXT,
+  model TEXT,
+  input JSONB,
+  output JSONB,
+  input_tokens INT,
+  output_tokens INT,
+  cost_usd NUMERIC(12,6),
+  metadata JSONB,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX spans_trace_idx   ON spans (trace_id);
+CREATE INDEX spans_project_idx ON spans (project_id, start_time DESC);
+
+CREATE TABLE model_prices (
+  model TEXT NOT NULL,
+  input_per_1m_usd NUMERIC(12,6) NOT NULL,
+  output_per_1m_usd NUMERIC(12,6) NOT NULL,
+  valid_from TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (model, valid_from)
+);
+```
+
+Trace-level views (total cost, duration, status) are computed from `spans` at read time.
+Only add a `traces` summary table if reads become slow, and if so, update totals only for rows
+actually inserted (`RETURNING`), so duplicate events never double-count cost.
+
+---
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/ingest` | Header `X-API-Key`. Validate batch, XADD to Redis, return `202` |
+| GET | `/v1/traces` | List traces. Filters: status, model, min cost, min duration, time range. Cursor pagination |
+| GET | `/v1/traces/{trace_id}` | All spans of a trace (flat). The dashboard builds the tree |
+| GET | `/v1/metrics/cost` | Cost per day, per model |
+| GET | `/v1/metrics/latency` | p50 / p95 duration per model |
+| GET | `/v1/metrics/errors` | Error rate over time |
+| GET | `/health` | Liveness, plus DB and Redis connectivity |
+
+---
+
+## SDK requirements (core — explain before coding)
+
+- **Public API:** `argus.init(api_key, host)`, `@argus.observe(name=None, kind="span")`,
+  `with argus.span("name"):` and `argus.wrap_openai(client)`.
+- **Nesting:** the current span lives in a `contextvars.ContextVar`. It must work for nested sync
+  functions, `async` functions and concurrent `asyncio` tasks.
+- **Errors in user code:** mark the span `status=error`, record the message, then re-raise.
+  Never swallow the user's exception.
+- **The SDK must never break or slow down the host app:**
+  - Bounded queue (default 10,000 events). When full, drop the oldest and count drops.
+  - Background daemon thread sends a batch every 1 s or every 100 events.
+  - Retries with exponential backoff + jitter on network errors and 5xx. No retry on 4xx.
+  - Short HTTP timeouts. SDK errors are logged, never raised into user code.
+  - `atexit` flush with a time limit.
+- **Payload size:** truncate `input` / `output` above a configurable limit (default 32 KB).
+
+## Worker requirements (core — explain before coding)
+
+- Consumer group `writers` on stream `spans`. Read up to 500 messages per batch.
+- Insert with `INSERT … ON CONFLICT (id) DO NOTHING`, then `XACK` **only after the DB commit**.
+- On startup and periodically, use `XAUTOCLAIM` to take over messages stuck with a dead consumer.
+- Compute `cost_usd` from `model_prices` (the price valid at `start_time`).
+- Cap the stream length with `MAXLEN ~` on `XADD`.
+
+---
+
+## Demo app: AI Debate Arena
+
+- `run_debate(topic, pro_model, con_model, judge_model, rounds=3)`
+- Each debate is one trace. Each round and turn is a span, each LLM call a generation, and each
+  `lookup_fact()` call a tool span.
+- The judge returns JSON `{winner, scores, reasoning}` validated with Pydantic. On invalid JSON,
+  retry once. Both attempts must be visible in the trace.
+- `LLM_PROVIDER=fake|ollama|openai` (Ollama and paid APIs via an OpenAI-compatible base URL).
+  The `fake` provider returns canned answers with realistic token counts, for tests and load tests.
+- Failure injection via env vars: `ARENA_TIMEOUT_RATE`, `ARENA_BAD_JSON_RATE`, `ARENA_SLOW_RATE`.
+- `traffic.py` runs N debates in parallel to fill the dashboard.
+
+## Dashboard
+
+- `/traces`: table with name, start time, duration, cost, status, models. Filters.
+- `/traces/[id]`: waterfall timeline of nested spans. Clicking a span shows input, output,
+  tokens, cost and error.
+- `/metrics`: cost per day, p50/p95 latency per model, error rate.
+
+---
+
+## Commands (target)
+
+```bash
+cp .env.example .env
+docker compose up -d --build      # postgres, redis, server, worker, dashboard
+make migrate                      # apply SQL migrations
+make seed                         # create a demo project + print its API key
+make demo                         # run one debate with LLM_PROVIDER=fake
+make traffic N=50                 # run many debates
+make test                         # pytest for sdk + server
+make lint                         # ruff
+make load                         # load test the ingestion API
+```
+
+---
+
+## Testing checklist
+
+- [ ] SDK: nested sync spans get the correct parent
+- [ ] SDK: nested async spans and concurrent tasks don't mix up parents
+- [ ] SDK: exceptions mark the span as error and are re-raised
+- [ ] SDK: exporter never blocks the caller when the server is down
+- [ ] SDK: queue overflow drops oldest events and counts them
+- [ ] Server: invalid API key → 401; invalid batch → 422
+- [ ] Server: the same batch sent twice → each span stored once
+- [ ] Server: a child span arriving before its parent is stored and shown correctly
+- [ ] Worker: killed mid-batch → messages are reclaimed and stored, no duplicates
+- [ ] End-to-end: `make demo` produces a complete trace visible in the dashboard
+- [ ] Load test: record events/second and p95 ingest latency in the README
+
+---
+
+## Milestones
+
+1. **Day 1:** Docker Compose, migrations, seed script, `POST /v1/ingest` writing straight to Postgres
+   with idempotent inserts. Tests for auth and duplicates.
+2. **Day 2:** SDK: context nesting, `@observe`, exporter with batching and retries,
+   `wrap_openai`. Unit tests.
+3. **Day 3:** Redis Stream + worker (consumer group, XACK, XAUTOCLAIM). Debate Arena with the
+   fake provider and failure injection. `traffic.py`.
+4. **Day 4:** Dashboard: trace list, waterfall view, span detail, metrics page.
+5. **Day 5:** Load test, README (architecture diagram, design decisions, measured numbers),
+   demo GIF. Stretch: PII redaction in the SDK, or prompt replay and compare.
+
+---
+
+## Code conventions
+
+- Type hints everywhere; Pydantic v2 models at every boundary.
+- `ruff` for linting and formatting.
+- Times are UTC and timezone-aware (`TIMESTAMPTZ`, `datetime.now(timezone.utc)`).
+- No ORM magic in hot paths: plain SQL via `psycopg` for inserts and queries.
+- Small, focused commits with clear messages.
+
+---
+
+## Design decisions (keep updated)
+
+| Decision | Why | Trade-off |
+|---|---|---|
+| SDK-generated span IDs + `ON CONFLICT DO NOTHING` | Retries can resend events; inserts must be idempotent | Relies on IDs being truly unique (ULID/UUID) |
+| Send spans when they end, not start + end events | Simpler protocol, one row per span | Long-running spans are invisible until they finish |
+| No FK on `parent_span_id` | Children can arrive before parents | The tree must be built and checked at read time |
+| `202 Accepted` after XADD, write to DB in the worker | Fast ingest, absorbs bursts, DB slowdowns don't hit clients | Data sits briefly in Redis; needs Redis persistence (AOF) |
+| Cost computed on the server | Prices change; one versioned source of truth | Server needs a maintained price table |
+| SDK drops oldest events when the queue is full | Never slow down or crash the host app | Possible data loss under extreme load, so drops are counted |

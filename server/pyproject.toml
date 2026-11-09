@@ -1,0 +1,5 @@
+# Tool config only; dependencies live in requirements*.txt (installed by the Dockerfile).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
